@@ -43,7 +43,8 @@ validation:
   clang_path: ""                  # empty = find `clang` on PATH
   timeout_s: 20
   require_behavior_checks: true   # keep true for acceptance based on evidence
-  behavior_inputs: []             # add trusted stdin fixtures; exact outputs are compared
+  behavior_inputs:
+    - ""                          # empty-string EOF smoke fixture for no-input demo programs
 
 # ------------------------------------------------------------
 # Pipeline mode

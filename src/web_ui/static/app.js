@@ -78,6 +78,7 @@ function render(data) {
   renderFunctionTable(data);
   renderLatencyChart(data);
   renderAntiPatterns(data);
+  renderSafetyPanel(data);
   renderPassTimeline(data);
   renderRewardBreakdown(data);
   renderBenchmark(data);
@@ -104,11 +105,11 @@ function updatePipelineInfo(data) {
     src.textContent = '📁 ' + data.source_path;
   }
   // Animate stages
-  const stageIds = ['stage-clang','stage-boss','stage-fixer','stage-irtuner','stage-hwtuner','stage-reward'];
+  const stageIds = ['stage-clang','stage-safety','stage-boss','stage-fixer','stage-irtuner','stage-hwtuner','stage-policy','stage-reward'];
   stageIds.forEach((id, i) => {
     const el = document.getElementById(id);
     if (el) {
-      setTimeout(() => el.style.animation = 'glow-pulse 2s ease 1', i * 200);
+      setTimeout(() => el.style.animation = 'glow-pulse 2s ease 1', i * 180);
     }
   });
 }
@@ -266,6 +267,109 @@ function renderAntiPatterns(data) {
       </div>
     `;
   }).join('');
+}
+
+/* ── Safety Checks & Policy Gate ─────────────────────────────────────── */
+function renderSafetyPanel(data) {
+  // 1. Security Scanner Findings
+  const findings = data.security_findings || [];
+  const findingSummaryEl = document.getElementById('safetyFindingSummary');
+  const findingsListEl   = document.getElementById('safetyFindingsList');
+
+  if (findings.length === 0) {
+    if (findingSummaryEl) {
+      findingSummaryEl.innerHTML = '<span class="safety-badge safety-badge-pass">✓ Clean (0 Findings)</span>';
+    }
+    if (findingsListEl) {
+      findingsListEl.innerHTML = '<div class="ap-empty">✓ No risky memory or C-library calls detected.</div>';
+    }
+  } else {
+    const highCount = findings.filter(f => (f.severity || '').toLowerCase() === 'high').length;
+    const medCount  = findings.filter(f => (f.severity || '').toLowerCase() === 'medium').length;
+    if (findingSummaryEl) {
+      const badgeClass = highCount > 0 ? 'safety-badge-fail' : 'safety-badge-warn';
+      findingSummaryEl.innerHTML = `
+        <span class="safety-badge ${badgeClass}">
+          ⚠️ ${findings.length} Finding(s) (${highCount} High, ${medCount} Medium)
+        </span>
+      `;
+    }
+    if (findingsListEl) {
+      findingsListEl.innerHTML = findings.map(f => {
+        const sevClass = (f.severity || '').toLowerCase() === 'high' ? 'sev-high' : 'sev-medium';
+        const func = f.function ? esc(f.function) : '&lt;global&gt;';
+        const lineStr = f.line ? `Line ${f.line}` : '';
+        const loc = [func, lineStr].filter(Boolean).join(' • ');
+        const snippetHtml = f.snippet ? `<div class="safety-snippet">${esc(f.snippet)}</div>` : '';
+        return `
+          <div class="safety-item">
+            <div class="safety-item-header">
+              <span class="sev-tag ${sevClass}">${esc(f.severity || 'info')}</span>
+              <span class="safety-rule">${esc(f.rule_id || 'RULE')}</span>
+              <span class="safety-loc">${loc}</span>
+            </div>
+            <div class="safety-msg">${esc(f.message || '')}</div>
+            ${snippetHtml}
+          </div>
+        `;
+      }).join('');
+    }
+  }
+
+  // 2. Policy Gate & Candidate Validation Decisions
+  const attempts = data.optimization_attempts || [];
+  const gateSummaryEl = document.getElementById('policyGateSummary');
+  const policyTbody   = document.getElementById('policyTableBody');
+
+  const accepted = attempts.filter(a => a.accepted).length;
+  const rejected = attempts.length - accepted;
+
+  if (gateSummaryEl) {
+    gateSummaryEl.innerHTML = `
+      <span class="safety-badge safety-badge-info">✓ ${accepted} Passes Accepted</span>
+      <span class="safety-badge ${rejected > 0 ? 'safety-badge-warn' : 'safety-badge-pass'}">
+        ${rejected} Rejected / Blocked
+      </span>
+    `;
+  }
+
+  if (policyTbody) {
+    if (attempts.length === 0) {
+      policyTbody.innerHTML = '<tr><td colspan="4" class="table-empty">No pass decisions recorded for this run.</td></tr>';
+    } else {
+      policyTbody.innerHTML = attempts.map(a => {
+        const policyOk = a.policy && a.policy.allowed;
+        const policyTag = policyOk
+          ? '<span class="tag-allowed">✓ Allowlisted</span>'
+          : '<span class="tag-blocked">✗ Blocked</span>';
+
+        let valTag = '<span class="verdict-adv">– Skipped</span>';
+        if (a.executed) {
+          if (a.validation && a.validation.passed) {
+            valTag = '<span class="verdict-pass">✓ Verified</span>';
+          } else if (a.validation && !a.validation.passed) {
+            valTag = '<span class="verdict-fail">✗ Failed</span>';
+          } else if (a.accepted) {
+            valTag = '<span class="verdict-pass">✓ Passed</span>';
+          } else {
+            valTag = '<span class="verdict-fail">✗ Rejected</span>';
+          }
+        }
+
+        const reason = esc(a.reason || (a.policy && a.policy.reason) || '');
+        const passName = esc(a.action || '');
+
+        return `
+          <tr>
+            <td><strong class="mono">${passName}</strong></td>
+            <td>${policyTag}</td>
+            <td>${valTag}</td>
+            <td style="color:var(--text2);font-size:11px;">${reason}</td>
+          </tr>
+        `;
+      }).join('');
+    }
+  }
 }
 
 /* ── Pass Timeline ──────────────────────────────────────────────────── */

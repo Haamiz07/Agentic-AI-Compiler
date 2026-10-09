@@ -149,7 +149,30 @@
     .explain-summary { font-size: 13px; color: var(--text2); line-height: 1.6; margin-bottom: 12px; }
     .explain-sub-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text4); margin-bottom: 7px; font-weight: 700; }
     .explain-reasons { display: flex; flex-wrap: wrap; gap: 6px; }
-    .explain-reason-tag { padding: 3px 9px; background: var(--accent-light); border: 1px solid rgba(79,70,229,0.18); border-radius: 20px; font-size: 11px; color: var(--accent); font-weight: 500; }
+    /* Safety Checks & Policy Gate */
+    .safety-summary-badges { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+    .safety-badge { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+    .safety-badge-pass { background: rgba(22,163,74,0.1); color: var(--green); border: 1px solid rgba(22,163,74,0.25); }
+    .safety-badge-fail { background: rgba(220,38,38,0.1); color: var(--red); border: 1px solid rgba(220,38,38,0.25); }
+    .safety-badge-warn { background: rgba(217,119,6,0.1); color: var(--gold); border: 1px solid rgba(217,119,6,0.25); }
+    .safety-badge-info { background: var(--accent-light); color: var(--accent); border: 1px solid var(--accent-ring); }
+    .safety-list { display: flex; flex-direction: column; gap: 10px; max-height: 280px; overflow-y: auto; }
+    .safety-item { border: 1px solid var(--card-border); border-radius: var(--r); padding: 12px 14px; background: var(--bg-soft); font-size: 12px; }
+    .safety-item-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .sev-tag { padding: 2px 7px; border-radius: 12px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+    .sev-high { background: rgba(220,38,38,0.12); color: var(--red); border: 1px solid rgba(220,38,38,0.25); }
+    .sev-medium { background: rgba(234,88,12,0.12); color: var(--warn); border: 1px solid rgba(234,88,12,0.25); }
+    .sev-low { background: rgba(79,70,229,0.1); color: var(--accent); border: 1px solid var(--accent-ring); }
+    .safety-rule { font-family: var(--mono); font-weight: 700; color: var(--text); }
+    .safety-loc { margin-left: auto; font-family: var(--mono); color: var(--text3); font-size: 11px; }
+    .safety-msg { color: var(--text2); margin-bottom: 6px; line-height: 1.4; }
+    .safety-snippet { font-family: var(--mono); background: #FFFFFF; border: 1px solid var(--card-border); border-radius: 4px; padding: 4px 8px; font-size: 11px; color: var(--text); white-space: nowrap; overflow-x: auto; }
+    .policy-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .policy-table th { padding: 8px 10px; text-align: left; color: var(--text3); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--card-border); background: var(--bg-soft); }
+    .policy-table td { padding: 9px 10px; border-bottom: 1px solid var(--card-border); vertical-align: middle; }
+    .policy-table tr:last-child td { border-bottom: none; }
+    .tag-allowed { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; background: rgba(22,163,74,0.1); color: var(--green); border: 1px solid rgba(22,163,74,0.2); }
+    .tag-blocked { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; background: rgba(220,38,38,0.1); color: var(--red); border: 1px solid rgba(220,38,38,0.2); }
     /* Footer */
     .footer { background: #FFFFFF; border-top: 1px solid var(--card-border); padding: 18px 0; }
     .footer-inner { display: flex; align-items: center; gap: 14px; } .footer-logo { font-weight: 800; font-size: 13px; color: var(--accent); } .footer-info { color: var(--text4); font-size: 12px; } .footer-refresh { margin-left: auto; font-size: 11px; color: var(--text4); font-family: var(--mono); }
@@ -197,6 +220,12 @@
         <span class="stage-sub">LLVM IR</span>
       </div>
       <span class="pipeline-arrow">→</span>
+      <div class="pipeline-stage" id="stage-safety">
+        <span class="stage-icon">🛡️</span>
+        <span class="stage-label">Safety Scan</span>
+        <span class="stage-sub">Source + IR</span>
+      </div>
+      <span class="pipeline-arrow">→</span>
       <div class="pipeline-stage" id="stage-boss">
         <span class="stage-icon">🧠</span>
         <span class="stage-label">Boss Agent</span>
@@ -221,9 +250,15 @@
         <span class="stage-sub">SIMD / Vectorise</span>
       </div>
       <span class="pipeline-arrow">→</span>
+      <div class="pipeline-stage" id="stage-policy">
+        <span class="stage-icon">🚪</span>
+        <span class="stage-label">Policy Gate</span>
+        <span class="stage-sub">LLVM Runner</span>
+      </div>
+      <span class="pipeline-arrow">→</span>
       <div class="pipeline-stage" id="stage-reward">
         <span class="stage-icon">🎯</span>
-        <span class="stage-label">Reward</span>
+        <span class="stage-label">Verifier</span>
         <span class="stage-sub">Store Exp</span>
       </div>
     </div>
@@ -342,6 +377,50 @@
         <div class="card-title">Agentic Pass Timeline</div>
         <div class="pass-timeline" id="passTimeline">
           <div class="timeline-empty">Waiting for pipeline data…</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ── Safety Checks & Policy Gate ──────────────────────────────────── -->
+<section class="section" style="padding-top:0">
+  <div class="container">
+    <div class="two-col">
+
+      <!-- Scanner Findings -->
+      <div class="card">
+        <div class="card-title">Security Analysis (Source & IR Scanner)</div>
+        <div class="safety-summary-badges" id="safetyFindingSummary">
+          <span class="safety-badge safety-badge-pass" id="safetyBadgeStatus">✓ Clean</span>
+        </div>
+        <div class="safety-list" id="safetyFindingsList">
+          <div class="ap-empty">✓ No risky memory or C-library calls detected.</div>
+        </div>
+      </div>
+
+      <!-- Policy Gate & Validation Decisions -->
+      <div class="card">
+        <div class="card-title">Policy Gate & Candidate Validation</div>
+        <div class="safety-summary-badges" id="policyGateSummary">
+          <span class="safety-badge safety-badge-info" id="policyBadgeAccepted">0 Passes Accepted</span>
+          <span class="safety-badge safety-badge-warn" id="policyBadgeRejected">0 Rejected / Blocked</span>
+        </div>
+        <div class="table-wrapper" style="max-height: 280px; overflow-y: auto;">
+          <table class="policy-table">
+            <thead>
+              <tr>
+                <th>Pass Name</th>
+                <th>Policy Gate</th>
+                <th>Validation</th>
+                <th>Decision Reason</th>
+              </tr>
+            </thead>
+            <tbody id="policyTableBody">
+              <tr><td colspan="4" class="table-empty">Waiting for policy decisions…</td></tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
