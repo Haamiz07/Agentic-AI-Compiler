@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Attack Lab — AGentic_C</title>
+  <link rel="stylesheet" href="attack_lab.css?v=2">
+</head>
+<body>
+  <header class="topbar">
+    <div><div class="brand">⚡ AGentic_C <span>ATTACK LAB</span></div><p>Compare current checks against labeled, hand-built security scenarios.</p></div>
+    <a class="back" href="/">← Compiler dashboard</a>
+  </header>
+  <main class="wrap">
+    <aside class="disclaimer"><b>Results measure only these hand-built scenarios, not general protection.</b> Scenario inputs are inert text; the lab never executes them. Agent traces are simulated, not captured from live tool use.</aside>
+
+    <section class="intro card">
+      <div><p class="eyebrow">VISIBLE DEMO DATASET</p><h1>Scenario evaluation</h1><p class="muted">Choose one attack category or combine all visible categories. Each category has six independently authored examples.</p></div>
+      <div class="controls"><label for="scenarioSelect">Scenario set</label><select id="scenarioSelect"><option>Loading categories…</option></select><button id="runButton">▶ Run selected scenarios</button></div>
+    </section>
+
+    <section class="metrics" aria-label="Selected scenario metrics">
+      <article class="metric card"><div class="label">Precision</div><div id="precision" class="value">—</div><div id="precisionDetail" class="sub">—</div></article>
+      <article class="metric card"><div class="label">Recall</div><div id="recall" class="value">—</div><div id="recallDetail" class="sub">—</div></article>
+      <article class="metric card"><div class="label">F1</div><div id="f1" class="value">—</div><div id="f1Detail" class="sub">—</div></article>
+      <article class="metric card" id="blockMetric"><div class="label">Block rate</div><div id="blockRate" class="value">—</div><div id="blockDetail" class="sub">—</div></article>
+      <article class="metric card score-card"><div class="label">Lines with no source-scanner match</div><div id="codeScore" class="value">—</div><div id="codeScoreSub" class="sub">Run the compiler first</div></article>
+      <article class="metric card"><div class="label">Patterns checked</div><div id="patterns" class="value">—</div><div id="patternsDetail" class="sub">Source, LLVM IR, and Attack Lab indicators</div></article>
+    </section>
+    <p id="setSummary" class="set-summary">Loading scenario report…</p>
+
+    <section class="card visualization-card">
+      <div class="section-heading"><div><p class="eyebrow">VISUAL SUMMARY</p><h2>How did the selected scenarios turn out?</h2></div></div>
+      <div class="viz-grid">
+        <div class="viz-panel">
+          <h3>Scenario outcomes</h3>
+          <div class="donut-layout">
+            <div id="outcomeDonut" class="donut" role="img" aria-label="Scenario outcome chart">
+              <div class="donut-hole"><strong id="donutTotal">—</strong><span>scenarios</span></div>
+            </div>
+            <div id="outcomeLegend" class="donut-legend" aria-label="Chart legend"></div>
+          </div>
+        </div>
+        <div class="viz-panel">
+          <h3>Detection percentages</h3>
+          <p class="viz-note">Each bar uses the selected scenario set; the count is shown beside its percentage.</p>
+          <div id="rateBars" class="rate-bars"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading"><div><p class="eyebrow">VERIFIABLE PER-SCENARIO RESULTS</p><h2>Detection results</h2></div><span id="runStamp" class="muted"></span></div>
+      <div class="confusion" id="confusion"></div>
+      <p id="metricMath" class="metric-math"></p>
+    </section>
+
+    <section class="card">
+      <div class="section-heading"><div><p class="eyebrow">INPUT AND VERDICT</p><h2>Scenario results</h2></div></div>
+      <div class="table-scroll"><table><thead><tr><th>Scenario and input</th><th>Scanner verdict</th><th>Expected</th><th>Outcome</th><th>Reason</th></tr></thead><tbody id="scenarioRows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody></table></div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading"><div><p class="eyebrow">FALSE NEGATIVES</p><h2>Known gaps</h2></div></div>
+      <div id="knownGaps" class="gap-list"><p class="empty">No report yet.</p></div>
+    </section>
+
+    <section class="card heldout-card">
+      <div class="section-heading"><div><p class="eyebrow">SEPARATE GENERALIZATION CHECK</p><h2>Held-out scenarios</h2></div><button id="heldoutButton" class="secondary">Show held-out results on request</button></div>
+      <p class="muted">Held-out cases are stored separately and excluded from the visible dropdown, visible metrics, and visible run log. They must not be used to tune detection rules.</p>
+      <div id="heldoutResults" hidden></div>
+    </section>
+
+    <footer>Visible runs are appended to <code>/tmp/agentic_c/attack_lab_log.jsonl</code>. Held-out results are evaluated separately and are not appended to that log.</footer>
+  </main>
+  <script src="attack_lab.js?v=2"></script>
+</body>
+</html>

@@ -22,11 +22,15 @@ import threading
 import webbrowser
 import http.server
 import socketserver
+from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
 
 # Path to the static files directory
 STATIC_DIR = Path(__file__).parent / "static"
+SRC_DIR = Path(__file__).resolve().parents[1]
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 DEFAULT_RESULTS_PATH = "/tmp/agentic_c/results_latest.json"
 DEFAULT_PORT = 5050
 
@@ -49,6 +53,8 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path == "/api/results":
             self._serve_results()
+        elif path == "/api/attack-lab":
+            self._serve_attack_lab()
         else:
             # Serve static file normally, but inject no-cache headers so the
             # browser ALWAYS fetches fresh CSS/JS instead of serving stale cache.
@@ -64,6 +70,53 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
             self._inject_no_cache = False
         super().end_headers()
 
+
+    def do_POST(self):
+        request = urlsplit(self.path)
+        path = request.path.rstrip("/")
+        params = parse_qs(request.query)
+        try:
+            from safety.attack_lab import build_report, save_report
+            source_path = self._latest_source_path()
+            if path == "/api/attack-lab/run":
+                category = params.get("category", [None])[0] or None
+                report = build_report(source_path, category=category)
+                save_report(report)
+            elif path == "/api/attack-lab/heldout":
+                # Explicit request only. Never mix held-out rows into visible logs or metrics.
+                report = build_report(source_path, heldout=True)
+            else:
+                self.send_error(404, "Unknown API endpoint")
+                return
+            self._send_json(report)
+        except Exception as exc:
+            self.send_error(500, str(exc))
+
+    def _send_json(self, payload):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _latest_source_path(self):
+        try:
+            with open(self.results_path, encoding="utf-8") as stream:
+                return json.load(stream).get("source_path", "")
+        except (OSError, json.JSONDecodeError):
+            return ""
+
+    def _serve_attack_lab(self):
+        """Return saved demo metrics plus a fresh heuristic scan of latest source."""
+        try:
+            params = parse_qs(urlsplit(self.path).query)
+            category = params.get("category", [None])[0] or None
+            from safety.attack_lab import latest_report
+            self._send_json(latest_report(self._latest_source_path(), category=category))
+        except Exception as exc:
+            self.send_error(500, str(exc))
 
     def _serve_results(self):
         """Serve the latest pipeline results as JSON."""
