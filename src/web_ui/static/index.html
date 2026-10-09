@@ -220,6 +220,12 @@
         <span class="stage-sub">LLVM IR</span>
       </div>
       <span class="pipeline-arrow">→</span>
+      <div class="pipeline-stage" id="stage-safety">
+        <span class="stage-icon">🛡️</span>
+        <span class="stage-label">Safety Scan</span>
+        <span class="stage-sub">Source + IR</span>
+      </div>
+      <span class="pipeline-arrow">→</span>
       <div class="pipeline-stage" id="stage-boss">
         <span class="stage-icon">🧠</span>
         <span class="stage-label">Boss Agent</span>
@@ -244,9 +250,15 @@
         <span class="stage-sub">SIMD / Vectorise</span>
       </div>
       <span class="pipeline-arrow">→</span>
+      <div class="pipeline-stage" id="stage-policy">
+        <span class="stage-icon">🚪</span>
+        <span class="stage-label">Policy Gate</span>
+        <span class="stage-sub">LLVM Runner</span>
+      </div>
+      <span class="pipeline-arrow">→</span>
       <div class="pipeline-stage" id="stage-reward">
         <span class="stage-icon">🎯</span>
-        <span class="stage-label">Reward</span>
+        <span class="stage-label">Verifier</span>
         <span class="stage-sub">Store Exp</span>
       </div>
     </div>

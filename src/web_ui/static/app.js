@@ -105,11 +105,11 @@ function updatePipelineInfo(data) {
     src.textContent = '📁 ' + data.source_path;
   }
   // Animate stages
-  const stageIds = ['stage-clang','stage-boss','stage-fixer','stage-irtuner','stage-hwtuner','stage-reward'];
+  const stageIds = ['stage-clang','stage-safety','stage-boss','stage-fixer','stage-irtuner','stage-hwtuner','stage-policy','stage-reward'];
   stageIds.forEach((id, i) => {
     const el = document.getElementById(id);
     if (el) {
-      setTimeout(() => el.style.animation = 'glow-pulse 2s ease 1', i * 200);
+      setTimeout(() => el.style.animation = 'glow-pulse 2s ease 1', i * 180);
     }
   });
 }
