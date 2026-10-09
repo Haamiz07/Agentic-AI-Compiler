@@ -150,6 +150,28 @@
     .explain-sub-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--text4); margin-bottom: 7px; font-weight: 700; }
     .explain-reasons { display: flex; flex-wrap: wrap; gap: 6px; }
     .explain-reason-tag { padding: 3px 9px; background: var(--accent-light); border: 1px solid rgba(79,70,229,0.18); border-radius: 20px; font-size: 11px; color: var(--accent); font-weight: 500; }
+    /* Safety and policy review */
+    .safety-summary { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 16px; }
+    .safety-stat { padding: 12px; border: 1px solid var(--card-border); border-radius: var(--r); background: var(--bg-soft); }
+    .safety-stat-value { font-size: 19px; font-weight: 800; color: var(--text); }
+    .safety-stat-label { margin-top: 3px; font-size: 10px; font-weight: 700; color: var(--text3); text-transform: uppercase; letter-spacing: .4px; }
+    .safety-list { display: flex; flex-direction: column; gap: 10px; max-height: 380px; overflow-y: auto; }
+    .safety-empty { padding: 22px 12px; text-align: center; color: var(--text3); font-size: 13px; line-height: 1.5; }
+    .safety-item { border: 1px solid var(--card-border); border-left: 4px solid var(--cold); border-radius: var(--r); padding: 12px 14px; background: #fff; }
+    .safety-item.sev-high, .safety-item.status-rejected { border-left-color: var(--red); }
+    .safety-item.sev-medium { border-left-color: var(--gold); }
+    .safety-item.status-accepted { border-left-color: var(--green); }
+    .safety-item-header { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 7px; }
+    .safety-code { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--accent); }
+    .safety-badge { padding: 2px 8px; border-radius: 99px; background: var(--bg-soft); color: var(--text2); font-size: 10px; font-weight: 700; text-transform: uppercase; }
+    .safety-badge.badge-accepted { background: #ECFDF3; color: #15803D; }
+    .safety-badge.badge-rejected { background: #FEF2F2; color: #B91C1C; }
+    .safety-message { color: var(--text2); font-size: 12px; line-height: 1.5; }
+    .safety-meta { margin-top: 6px; color: var(--text3); font-size: 11px; overflow-wrap: anywhere; }
+    .safety-reason { margin-top: 7px; color: var(--text2); font-size: 12px; line-height: 1.5; }
+    .safety-snippet { display: block; margin-top: 8px; padding: 8px 10px; border-radius: 6px; background: var(--bg-soft); color: var(--text2); font-family: var(--mono); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .safety-footnote { margin-top: 12px; color: var(--text3); font-size: 11px; line-height: 1.5; }
+    @media (max-width:600px) { .safety-summary { grid-template-columns: 1fr; } }
     /* Footer */
     .footer { background: #FFFFFF; border-top: 1px solid var(--card-border); padding: 18px 0; }
     .footer-inner { display: flex; align-items: center; gap: 14px; } .footer-logo { font-weight: 800; font-size: 13px; color: var(--accent); } .footer-info { color: var(--text4); font-size: 12px; } .footer-refresh { margin-left: auto; font-size: 11px; color: var(--text4); font-family: var(--mono); }
@@ -182,6 +204,7 @@
       <span id="statusText">Connecting…</span>
     </div>
 
+    <a class="btn-refresh" href="/attack_lab.html" style="text-decoration:none">🛡 Attack Lab</a>
     <button class="btn-refresh" id="btnRefresh" onclick="fetchResults()">⟳ Refresh</button>
   </div>
 </header>
@@ -195,6 +218,12 @@
         <span class="stage-icon">⚙️</span>
         <span class="stage-label">Clang</span>
         <span class="stage-sub">LLVM IR</span>
+      </div>
+      <span class="pipeline-arrow">→</span>
+      <div class="pipeline-stage" id="stage-safety">
+        <span class="stage-icon">🛡️</span>
+        <span class="stage-label">Safety Scan</span>
+        <span class="stage-sub">Source + IR</span>
       </div>
       <span class="pipeline-arrow">→</span>
       <div class="pipeline-stage" id="stage-boss">
@@ -221,9 +250,15 @@
         <span class="stage-sub">SIMD / Vectorise</span>
       </div>
       <span class="pipeline-arrow">→</span>
+      <div class="pipeline-stage" id="stage-policy">
+        <span class="stage-icon">🚪</span>
+        <span class="stage-label">Policy Gate</span>
+        <span class="stage-sub">LLVM Runner</span>
+      </div>
+      <span class="pipeline-arrow">→</span>
       <div class="pipeline-stage" id="stage-reward">
         <span class="stage-icon">🎯</span>
-        <span class="stage-label">Reward</span>
+        <span class="stage-label">Verifier</span>
         <span class="stage-sub">Store Exp</span>
       </div>
     </div>
@@ -349,6 +384,31 @@
   </div>
 </section>
 
+<!-- ── New milestone: Security findings and policy decisions ─────────── -->
+<section class="section" style="padding-top:0">
+  <div class="container">
+    <div class="card">
+      <div class="card-title">Safety Checks &amp; Policy Gate</div>
+      <div class="safety-summary" aria-live="polite">
+        <div class="safety-stat"><div class="safety-stat-value" id="safetyFindingCount">0</div><div class="safety-stat-label">Scanner findings</div></div>
+        <div class="safety-stat"><div class="safety-stat-value" id="safetyAcceptedCount">0</div><div class="safety-stat-label">Passes accepted</div></div>
+        <div class="safety-stat"><div class="safety-stat-value" id="safetyRejectedCount">0</div><div class="safety-stat-label">Passes not accepted</div></div>
+      </div>
+      <div class="two-col">
+        <div>
+          <div class="card-title">Source / IR findings</div>
+          <div class="safety-list" id="securityFindings" aria-live="polite"><div class="safety-empty">Waiting for scan results…</div></div>
+        </div>
+        <div>
+          <div class="card-title">Optimization decisions</div>
+          <div class="safety-list" id="optimizationDecisions" aria-live="polite"><div class="safety-empty">Waiting for policy results…</div></div>
+        </div>
+      </div>
+      <p class="safety-footnote">The scanner uses a limited set of patterns. A clean result is not proof that code is safe. Behavior checks cover only the configured inputs.</p>
+    </div>
+  </div>
+</section>
+
 <!-- ── Reward Breakdown ────────────────────────────────────────────────── -->
 <section class="section" style="padding-top:0">
   <div class="container">
@@ -410,6 +470,6 @@
   </div>
 </footer>
 
-<script src="app.js?v=3"></script>
+<script src="app.js?v=4"></script>
 </body>
 </html>

@@ -1,0 +1,165 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=0.85in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{navy}{HTML}{17365D}
+\definecolor{lightblue}{HTML}{EAF1F8}
+\setlist[itemize]{leftmargin=1.35em,itemsep=2pt,topsep=3pt}
+\renewcommand{\arraystretch}{1.2}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{\vspace{-1.2em}\textbf{Weekly Project Progress Report}\\
+\large Agentic AI Compiler Optimization System}
+\author{Haamiz Suhail Hakeem (25CSB1A70)\\
+Shrot Amish Parekh (25CSB1A62)}
+\date{Reporting period: 11 September--9 October 2026}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+
+\begin{abstract}
+This report records the team's review of the inherited compiler project, the first implementation milestone for controlled optimization, and a dashboard update through 9 October 2026. The inherited project already had a command-line compiler workflow, agent-style components, LLVM IR handling, and a results dashboard. The work adds source/IR safety scanning, an allowlisted LLVM pass policy, guarded pass execution, candidate validation, structured audit records, pipeline reporting, and a dashboard panel for reviewing safety results. This remains an early prototype: prompt-injection attack simulation and detection metrics, a browser code editor, broad correctness proof, and real performance benchmarking are not yet implemented.
+\end{abstract}
+
+\section{Project purpose and scope}
+The project aims to take a C or C++ source file, examine its compiler representation, select optimization actions, and report what happened. The first milestone focuses on a safety boundary around those actions: only configured LLVM passes may be attempted, and an optimization candidate is retained only when the configured checks pass.
+
+\noindent\textbf{Current interface:} source code is supplied as a file through the command line. The browser dashboard displays pipeline results; it is not currently an online code editor where users type or upload code.
+
+\section{Inherited project review: Week 1}
+\textbf{Week 1: 11--17 September 2026 --- study of previous owners' work}
+
+The team reviewed the repository structure and followed the main compilation path through the pipeline, agents, configuration, memory/reward components, and dashboard.
+
+\begin{itemize}
+  \item \textbf{Work already present:} a Python pipeline that invokes Clang and handles LLVM IR; a Boss Agent that organizes work by code unit and HOT/COLD path; Fixer, IR Tuner, and HW Tuner components; reward and experience-memory components; and a web dashboard for displaying results.
+  \item \textbf{Observation:} the project had an end-to-end prototype shape, but several optimizer and latency behaviors could run in stub/demo mode. The dashboard visualized results but did not provide a source-code editor.
+  \item \textbf{Limitations identified:} there was no distinct policy gate between pass recommendations and LLVM execution; no consistent candidate-validation boundary; limited, pattern-based security analysis; and some latency/reward values were estimates rather than independent measurements.
+  \item \textbf{Inference:} the existing code was a useful compiler-agent prototype, but it needed explicit controls and evidence before it could credibly be described as a secure optimizer. The first addition should therefore be a constrained policy and validation layer, rather than a larger autonomous planner.
+\end{itemize}
+
+\subsection*{Week 1 work allocation}
+\begin{tabularx}{\linewidth}{@{}p{0.25\linewidth}Y@{}}
+\toprule
+\textbf{Team member} & \textbf{Review focus} \\
+\midrule
+Haamiz Suhail Hakeem & Pipeline flow, compiler/IR handling, Boss Agent, and the existing tuner handoff. \\
+Shrot Amish Parekh & Fixer and analysis components, configuration, reward/memory, and dashboard/reporting flow. \\
+\bottomrule
+\end{tabularx}
+
+\section{Architecture and work planning: Week 2}
+\textbf{Week 2: 18--24 September 2026 --- define the first implementation milestone}
+
+Based on the review, the team agreed to preserve the existing pipeline and add a modular safety layer around optimization. The planned flow became:
+
+\begin{center}
+\fcolorbox{navy}{lightblue}{\parbox{0.94\linewidth}{\centering
+ C/C++ source $\rightarrow$ Clang and LLVM IR $\rightarrow$ safety scan $\rightarrow$ existing planner/tuners $\rightarrow$ policy gate $\rightarrow$ LLVM pass runner and IR verifier $\rightarrow$ compile/behavior validation $\rightarrow$ selected IR and report}}
+\end{center}
+
+The milestone was scoped to include four structured records (policy decision, security finding, validation result, and optimization attempt), a fail-closed pass allowlist, a small explainable scanner, a guarded LLVM runner, candidate validation, and integration with existing output reporting.
+
+\subsection*{Week 2 work allocation}
+\begin{tabularx}{\linewidth}{@{}p{0.25\linewidth}Y@{}}
+\toprule
+\textbf{Team member} & \textbf{Planned ownership} \\
+\midrule
+Haamiz Suhail Hakeem & Policy gate, pass allowlist, controller/runner design, and connection points in the pipeline. \\
+Shrot Amish Parekh & Security finding rules, validation/data models, configuration, and documentation/report requirements. \\
+\bottomrule
+\end{tabularx}
+
+\section{Implementation and integration: Week 3}
+\textbf{Week 3: 25--30 September 2026 --- implement the safety/control layer}
+
+The safety components were added under \texttt{src/safety/} and connected to the existing pipeline.
+
+\begin{itemize}
+  \item \textbf{Security analysis:} scans source and LLVM IR for selected risky calls and memory-copy patterns. Findings include a rule, severity, location, likely function, and code snippet where available.
+  \item \textbf{Policy gate:} normalizes proposed pass names, allows only entries in the configured allowlist, and records why actions are rejected, skipped, or authorized.
+  \item \textbf{LLVM execution:} invokes \texttt{opt} without a shell, applies one allowed pass at a time, and checks output with LLVM's IR verifier.
+  \item \textbf{Candidate validation:} compiles both baseline and candidate IR. When trusted input fixtures are configured, it also compares process exit status, standard output, and standard error on those inputs.
+  \item \textbf{Fail-safe behavior:} a missing tool or failed scan, pass, verifier, compile, or required behavior check blocks that candidate. The pipeline retains the original or last accepted IR.
+  \item \textbf{Reporting and memory:} the pipeline result/dashboard JSON now carries structured findings and pass decisions. Experience memory records only passes accepted through the new validation path.
+  \item \textbf{Configuration and documentation:} added settings for the allowlist, tool paths, timeouts, pass limit, and behavior fixtures, plus a document describing operation and limitations.
+\end{itemize}
+
+\subsection*{Week 3 work allocation}
+\begin{tabularx}{\linewidth}{@{}p{0.25\linewidth}Y@{}}
+\toprule
+\textbf{Team member} & \textbf{Implementation responsibility} \\
+\midrule
+Haamiz Suhail Hakeem & Integrate the controller into the main compile flow; connect approved pass recommendations to LLVM execution; ensure the selected IR is used for final code generation. \\
+Shrot Amish Parekh & Implement the source/IR finding and validation records; prepare validation/configuration guidance; expose structured safety results in reporting and document limitations. \\
+\bottomrule
+\end{tabularx}
+
+\section{Local toolchain and fixture setup: Week 4}
+\textbf{Week 4: 1--6 October 2026 --- prepare the guarded optimizer for local runs}
+
+The local LLVM optimizer was installed and its availability confirmed as Homebrew LLVM 23.1.2. The bundled C++ examples were reviewed for standard-input use; their demo entry points do not read from standard input. An empty-input (EOF) fixture was therefore added to the default validation configuration so baseline and candidate executions can be compared for these no-input demos.
+
+\begin{itemize}
+  \item The behavior gate remains strict: a candidate must compile and produce the same exit status, standard output, and standard error as the baseline on the configured fixture.
+  \item The empty-input fixture is only a smoke check for bundled examples. Programs that read input need representative, terminating fixtures before their optimized candidates can be meaningfully checked.
+  \item The command-line pipeline and separate dashboard launch workflow were used for local demonstration. The dashboard remains a report view rather than a code editor.
+\end{itemize}
+
+\subsection*{Week 4 work allocation}
+\begin{tabularx}{\linewidth}{@{}p{0.25\linewidth}Y@{}}
+\toprule
+\textbf{Team member} & \textbf{Current-period contribution area} \\
+\midrule
+Haamiz Suhail Hakeem & Local LLVM setup and confirmation; command-line pipeline and dashboard run workflow. \\
+Shrot Amish Parekh & Review bundled-example input behavior; fixture configuration and explanation of validation scope. \\
+\bottomrule
+\end{tabularx}
+
+\section{Dashboard safety review: Week 5}
+\textbf{Week 5: 7--9 October 2026 --- make safety decisions visible during demonstrations}
+
+The dashboard was extended to present safety data already produced by the compiler pipeline. The added \textit{Safety Checks \& Policy Gate} panel displays scanner finding counts and details, optimization pass acceptance/rejection counts, policy status, validation status, and recorded decision reasons. It also shows whether compilation and configured behavior checks passed. This makes the existing control flow easier to inspect during a demonstration; it does not add a new attack detector or change which checks the pipeline performs.
+
+The configuration uses an empty-input fixture for the bundled examples that do not read standard input. The dashboard's JavaScript and HTML syntax were checked after the panel was added. A live browser demonstration of the updated panel was not verified in this reporting period.
+
+\subsection*{Week 5 contribution record}
+The repository records the dashboard and fixture changes, but does not provide reliable evidence to attribute each change to an individual team member. This report therefore records them as team project work without assigning individual ownership.
+
+\section{Current status and verification}
+\begin{itemize}
+  \item The new Python files passed a syntax parse, and the YAML configuration parsed successfully.
+  \item The LLVM toolchain was installed locally; the team confirmed Homebrew \texttt{opt} version 23.1.2 was available.
+  \item The default configuration has \texttt{require\_behavior\_checks: true} and one empty-input smoke fixture for the bundled no-input examples. Programs that consume stdin need appropriate fixtures; otherwise their behavior coverage is weak.
+  \item A full end-to-end correctness/performance evaluation has not yet been completed. The existing tuner latency figures remain estimates; no real benchmark result is claimed by this milestone.
+  \item The project currently accepts source-file paths through the CLI. Adding a browser code editor is a separate future interface task.
+  \item The dashboard can display the scanner and optimization decision records from a fresh pipeline result. The recent HTML and JavaScript changes passed syntax checks; the live updated page has not been confirmed in a browser.
+  \item The safety layer does not yet simulate prompt-injection or policy-bypass attacks, detect malicious agendas in generated code, create attack-specific logs, or calculate detection precision, recall, and F1. Those are separate requirements identified for the next security milestone.
+\end{itemize}
+
+\section{Progress estimate}
+The approximate overall completion remains \textbf{30\%} of the proposed full system, carried forward from the previous report. This is a planning estimate, not a measured score, and has not been recalculated for the dashboard update. The safety/control milestone is implemented in code; representative input coverage, attack simulation and detection, and an end-to-end performance evaluation remain outstanding.
+
+\section{Next steps}
+\begin{enumerate}[leftmargin=1.5em,itemsep=2pt]
+  \item Add representative, terminating behavior fixtures for programs that consume input and confirm that accepted candidates match their baselines.
+  \item Run a complete pipeline pass with matching LLVM tools; record rejected and accepted actions and their explanations.
+  \item Build an attack test set for prompt injection, policy bypass, and malicious code changes; define expected block/log outcomes and measure precision, recall, and F1 against the labeled cases.
+  \item Add a repeatable benchmark harness and report measured runtime/code-size results separately from estimates.
+  \item Improve source-to-IR location mapping and broaden security checks carefully, with clear false-positive/false-negative limits.
+  \item In a later milestone, consider a browser source-input/editor flow and a richer planner, critic, and verifier loop, while keeping the policy and validation boundary in place.
+\end{enumerate}
+
+\section*{Reporting note}
+The repository did not provide reliable dated activity records for every task. The four reporting weeks above organize the work retrospectively by project sequence. The listed work allocation is a proposed division of responsibility for the paired team and should be adjusted if the team's actual contributions differed.
+
+\end{document}

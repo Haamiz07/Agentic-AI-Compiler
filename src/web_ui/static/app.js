@@ -79,6 +79,7 @@ function render(data) {
   renderLatencyChart(data);
   renderAntiPatterns(data);
   renderPassTimeline(data);
+  renderSafetyReview(data);
   renderRewardBreakdown(data);
   renderBenchmark(data);
   renderExplainability(data);
@@ -104,11 +105,11 @@ function updatePipelineInfo(data) {
     src.textContent = '📁 ' + data.source_path;
   }
   // Animate stages
-  const stageIds = ['stage-clang','stage-boss','stage-fixer','stage-irtuner','stage-hwtuner','stage-reward'];
+  const stageIds = ['stage-clang','stage-safety','stage-boss','stage-fixer','stage-irtuner','stage-hwtuner','stage-policy','stage-reward'];
   stageIds.forEach((id, i) => {
     const el = document.getElementById(id);
     if (el) {
-      setTimeout(() => el.style.animation = 'glow-pulse 2s ease 1', i * 200);
+      setTimeout(() => el.style.animation = 'glow-pulse 2s ease 1', i * 180);
     }
   });
 }
@@ -294,6 +295,64 @@ function renderPassTimeline(data) {
       </div>
     `;
   }).join('');
+}
+
+/* ── Safety scanner and policy-gate results ────────────────────────────── */
+function renderSafetyReview(data) {
+  const findings = Array.isArray(data.security_findings) ? data.security_findings : [];
+  const attempts = Array.isArray(data.optimization_attempts) ? data.optimization_attempts : [];
+  const accepted = attempts.filter(item => item && item.accepted).length;
+  const rejected = attempts.length - accepted;
+
+  setText('safetyFindingCount', String(findings.length));
+  setText('safetyAcceptedCount', String(accepted));
+  setText('safetyRejectedCount', String(rejected));
+
+  const findingsWrap = document.getElementById('securityFindings');
+  if (findingsWrap) {
+    findingsWrap.innerHTML = findings.length ? findings.map(f => {
+      const severity = String(f.severity || 'info').toLowerCase();
+      const location = `${f.file_path || 'unknown file'}${f.line ? `:${f.line}` : ''}`;
+      return `
+        <article class="safety-item sev-${esc(severity)}">
+          <div class="safety-item-header">
+            <span class="safety-code">${esc(f.rule_id || 'SAFETY-FINDING')}</span>
+            <span class="safety-badge">${esc(severity)}</span>
+            <span class="safety-badge">${esc(f.source_kind || 'source')}</span>
+          </div>
+          <div class="safety-message">${esc(f.message || 'Review this pattern.')}</div>
+          <div class="safety-meta">${esc(location)} · function ${esc(f.function || 'unknown')}</div>
+          ${f.snippet ? `<code class="safety-snippet">${esc(f.snippet)}</code>` : ''}
+        </article>`;
+    }).join('') : '<div class="safety-empty">No patterns from this scanner were found in this run.</div>';
+  }
+
+  const decisionsWrap = document.getElementById('optimizationDecisions');
+  if (decisionsWrap) {
+    decisionsWrap.innerHTML = attempts.length ? attempts.map(item => {
+      const policy = item.policy || {};
+      const validation = item.validation || null;
+      const acceptedAction = !!item.accepted;
+      const policyLabel = policy.allowed ? 'Allowed by policy' : 'Blocked by policy';
+      const validationLabel = validation
+        ? (validation.passed ? 'Validation passed' : 'Validation failed')
+        : (item.executed ? 'Validation not completed' : 'Not executed');
+      const reason = item.reason || policy.reason || 'No explanation recorded.';
+      const checks = validation
+        ? `<div class="safety-meta">Compiled: ${validation.compile_success ? 'yes' : 'no'} · Behavior checked: ${validation.behavior_checked ? 'yes' : 'no'}${validation.behavior_checked ? ` · Same output: ${validation.behavior_preserved ? 'yes' : 'no'}` : ''}</div>`
+        : '';
+      return `
+        <article class="safety-item ${acceptedAction ? 'status-accepted' : 'status-rejected'}">
+          <div class="safety-item-header">
+            <span class="safety-code">${esc(item.action || 'unknown action')}</span>
+            <span class="safety-badge ${acceptedAction ? 'badge-accepted' : 'badge-rejected'}">${acceptedAction ? 'Accepted' : 'Not accepted'}</span>
+          </div>
+          <div class="safety-meta">${esc(policyLabel)} · ${esc(validationLabel)}</div>
+          <div class="safety-reason">${esc(reason)}</div>
+          ${checks}
+        </article>`;
+    }).join('') : '<div class="safety-empty">No pass decisions recorded for this run. Run a fresh compile to populate this panel.</div>';
+  }
 }
 
 /* ── Reward Breakdown ─────────────────────────────────────────────────── */
