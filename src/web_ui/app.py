@@ -18,10 +18,12 @@ import os
 import sys
 import json
 import time
+import tempfile
 import threading
 import webbrowser
 import http.server
 import socketserver
+from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
@@ -29,8 +31,11 @@ from pathlib import Path
 # Path to the static files directory
 STATIC_DIR = Path(__file__).parent / "static"
 SRC_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = SRC_DIR.parent
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 DEFAULT_RESULTS_PATH = "/tmp/agentic_c/results_latest.json"
 DEFAULT_PORT = 5050
 
@@ -50,11 +55,14 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         # Strip query string (e.g. ?t=1234 or ?v=3 cache-busting) before routing
-        path = self.path.split("?")[0].rstrip("/")
+        parsed = urlsplit(self.path)
+        path = parsed.path.rstrip("/")
         if path == "/api/results":
             self._serve_results()
         elif path == "/api/attack-lab":
             self._serve_attack_lab()
+        elif path == "/api/source":
+            self._serve_source(parse_qs(parsed.query))
         else:
             # Serve static file normally, but inject no-cache headers so the
             # browser ALWAYS fetches fresh CSS/JS instead of serving stale cache.
@@ -76,6 +84,9 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
         path = request.path.rstrip("/")
         params = parse_qs(request.query)
         try:
+            if path == "/api/compile":
+                self._handle_compile()
+                return
             from safety.attack_lab import build_report, save_report
             source_path = self._latest_source_path()
             if path == "/api/attack-lab/run":
@@ -92,9 +103,141 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as exc:
             self.send_error(500, str(exc))
 
-    def _send_json(self, payload):
+    @staticmethod
+    def _validate_approved_path(requested: str, root_dir: Path) -> Optional[Path]:
+        """
+        Validate that the requested path strictly resolves within approved source directories
+        (examples/ or live edited sources). Explicitly rejects any '..' directory traversal
+        or external absolute paths.
+        """
+        if not requested or not isinstance(requested, str):
+            return None
+        raw_str = requested.strip()
+        if not raw_str:
+            return None
+
+        # Explicitly reject '..' traversal components upfront
+        raw_parts = Path(raw_str).parts
+        if ".." in raw_parts:
+            return None
+
+        raw_path = Path(raw_str)
+        if raw_path.is_absolute():
+            cand = raw_path.resolve()
+        else:
+            # Check relative to examples/ first, then relative to root_dir
+            ex_cand = (root_dir / "examples" / raw_path).resolve()
+            if ex_cand.is_file():
+                cand = ex_cand
+            else:
+                cand = (root_dir / raw_path).resolve()
+
+        approved_dirs = [
+            (root_dir / "examples").resolve(),
+            Path("/tmp/agentic_c/live_sources").resolve(),
+            (Path(tempfile.gettempdir()) / "agentic_c" / "live_sources").resolve(),
+        ]
+
+        for app_dir in approved_dirs:
+            try:
+                cand.relative_to(app_dir)
+                return cand
+            except ValueError:
+                continue
+        return None
+
+    def _serve_source(self, params: dict):
+        """Return available example C/C++ files and the source text of the requested file."""
+        root_dir = SRC_DIR.parent
+        examples_dir = (root_dir / "examples").resolve()
+        files = []
+        if examples_dir.is_dir():
+            files = [f"examples/{p.name}" for p in sorted(examples_dir.glob("*.cpp")) + sorted(examples_dir.glob("*.c"))]
+
+        raw_requested = (
+            params.get("file", [None])[0]
+            or params.get("path", [None])[0]
+        )
+        if raw_requested:
+            valid_path = self._validate_approved_path(raw_requested, root_dir)
+            if not valid_path or not valid_path.is_file():
+                self._send_json({
+                    "ok": False,
+                    "error": f"Access denied: Requested path '{raw_requested}' is outside approved source directories.",
+                    "file": str(raw_requested),
+                    "available_files": files,
+                    "source_code": "",
+                }, status=403)
+                return
+            cand = valid_path
+            rel_file = str(raw_requested)
+        else:
+            latest = self._latest_source_path()
+            cand = self._validate_approved_path(latest, root_dir) if latest else None
+            if not cand or not cand.is_file():
+                cand = (examples_dir / "market_maker.cpp").resolve() if examples_dir.is_dir() else None
+            rel_file = f"examples/{cand.name}" if cand else "examples/market_maker.cpp"
+
+        source_code = ""
+        if cand and cand.is_file():
+            source_code = cand.read_text(encoding="utf-8", errors="replace")
+        self._send_json({
+            "ok": bool(source_code),
+            "file": rel_file,
+            "available_files": files,
+            "source_code": source_code,
+        })
+
+    def _handle_compile(self):
+        """Compile edited or selected C/C++ source code via Pipeline and update results_latest.json."""
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw_body = self.rfile.read(length).decode("utf-8", errors="replace") if length > 0 else "{}"
+        payload = json.loads(raw_body) if raw_body.strip() else {}
+        filename = str(payload.get("filename") or "examples/market_maker.cpp").strip()
+        source_code = payload.get("source_code")
+        emit_binary = bool(payload.get("emit_binary", True))
+
+        root_dir = SRC_DIR.parent
+        if isinstance(source_code, str) and source_code.strip():
+            safe_name = Path(filename).name
+            if not safe_name or ".." in Path(filename).parts:
+                self._send_json({
+                    "ok": False,
+                    "error": f"Access denied: Invalid filename '{filename}'.",
+                }, status=403)
+                return
+            if not safe_name.endswith((".cpp", ".c", ".cc", ".cxx")):
+                safe_name += ".cpp"
+            live_dir = Path("/tmp/agentic_c/live_sources").resolve()
+            live_dir.mkdir(parents=True, exist_ok=True)
+            target_path = live_dir / safe_name
+            target_path.write_text(source_code, encoding="utf-8")
+            compile_target = str(target_path)
+        else:
+            valid_path = self._validate_approved_path(filename, root_dir)
+            if not valid_path or not valid_path.is_file():
+                self._send_json({
+                    "ok": False,
+                    "error": f"Access denied: File '{filename}' is outside approved source directories.",
+                }, status=403)
+                return
+            compile_target = str(valid_path)
+
+        from pipeline import Pipeline, _HOTNESS_CACHE
+        pipe = Pipeline(config_path=str(root_dir / "configs" / "config.yaml"), stub_mode=True)
+        res = pipe.compile(compile_target, emit_binary=emit_binary)
+
+        explanation = pipe.explainer.explain(res, hotness_scores=_HOTNESS_CACHE.copy()) if pipe.explainer else None
+        reward_bd = pipe.reward_engine.compute(res.hot_unit_results, res.cold_unit_results) if pipe.reward_engine else None
+        d = pipeline_result_to_dict(res, explanation=explanation, reward_breakdown=reward_bd)
+        os.makedirs(os.path.dirname(self.results_path), exist_ok=True)
+        with open(self.results_path, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        self._send_json({"ok": True, "results": d})
+
+    def _send_json(self, payload, status=200):
         data = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
@@ -247,6 +390,7 @@ def pipeline_result_to_dict(pipeline_result,
             item.to_dict() if hasattr(item, "to_dict") else item
             for item in getattr(result, "optimization_attempts", [])
         ],
+        "empirical_benchmark": getattr(result, "empirical_benchmark", {}) or {},
     }
 
     # HOT unit results

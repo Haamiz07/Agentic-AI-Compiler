@@ -47,10 +47,17 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 # Resolve paths whether run from project root or src/
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 _SRC = Path(__file__).parent
 _ROOT = _SRC.parent if _SRC.name == "src" else _SRC
 sys.path.insert(0, str(_ROOT / "src" / "agents"))
 sys.path.insert(0, str(_ROOT / "src"))
+sys.path.insert(0, str(_ROOT))
 
 try:
     from agents.boss_agent      import BossAgent, CompilationContext, PathLabel, _HOTNESS_CACHE
@@ -75,6 +82,7 @@ except ImportError:
 
 from safety import (SecurityAnalyzer, SafeOptimizationController,
                     OptimizationAttemptRecord, PolicyDecision)
+from safety.validator import _locate_tool, _DEFAULT_TOOLCHAIN_DIRS
 
 try:
     from web_ui.app import WebUIServer, pipeline_result_to_dict
@@ -123,6 +131,7 @@ class PipelineResult:
     notes:            str             = ""
     security_findings: list            = field(default_factory=list)
     optimization_attempts: list        = field(default_factory=list)
+    empirical_benchmark: dict          = field(default_factory=dict)
 
 
 @dataclass
@@ -229,6 +238,15 @@ class Pipeline:
             }
         )
 
+        # ── Stage 0: Entrance Adversarial / Prompt-Injection Guard ────
+        entrance_guard_enabled = self.config.get("policy_gate", {}).get("entrance_prompt_guard", True)
+        adversarial_findings = []
+        if entrance_guard_enabled:
+            try:
+                adversarial_findings = self.security_analyzer.scan_adversarial_directives(source_path)
+            except Exception:
+                adversarial_findings = []
+
         # ── Stage 1: Clang frontend → IR ──────────────────────────────
         t = time.perf_counter()
         ir_path = self._emit_ir(source_path)
@@ -243,7 +261,9 @@ class Pipeline:
         t = time.perf_counter()
         security_scan_error = ""
         try:
-            security_findings = self.security_analyzer.analyze(source_path, ir_path)
+            security_findings = self.security_analyzer.analyze(
+                source_path, ir_path, include_prompt_scan=entrance_guard_enabled
+            )
         except Exception as exc:
             security_findings = []
             security_scan_error = f"{type(exc).__name__}: {exc}"
@@ -261,12 +281,13 @@ class Pipeline:
         code_units = self._extract_code_units(source_path, ir_path)
 
         ctx = CompilationContext(
-            source_path  = source_path,
-            source_lang  = Path(source_path).suffix.lstrip("."),
-            target_arch  = self.config.get("compiler", {}).get("target_arch", "arm64"),
-            ir_embedding = None,
-            hft_mode     = self.hft_mode,
-            code_units   = code_units,
+            source_path       = source_path,
+            source_lang       = Path(source_path).suffix.lstrip("."),
+            target_arch       = self.config.get("compiler", {}).get("target_arch", "arm64"),
+            ir_embedding      = None,
+            hft_mode          = self.hft_mode,
+            code_units        = code_units,
+            security_findings = security_findings,
         )
         plan = self.boss_agent.decide(ctx)
         stage_times["boss_agent"] = time.perf_counter() - t
@@ -283,7 +304,8 @@ class Pipeline:
                 from agents.boss_agent import SimpleIREncoder
                 import os as _os
                 if _os.path.exists(ir_path):
-                    _emb = SimpleIREncoder().encode(open(ir_path).read())
+                    _raw = SimpleIREncoder().encode(open(ir_path).read())
+                    _emb = np.pad(_raw, (0, max(0, 256 - len(_raw))), mode="wrap")[:256].astype(np.float32)
                     _similar = self.store.query_similar(_emb, top_k=3)
                     if _similar:
                         # Count how many times similar IR has been seen
@@ -304,6 +326,7 @@ class Pipeline:
             plan, ir_path, stage_times,
             cached_sequence=cached_sequence,
             experience_hits=experience_hits,
+            security_findings=security_findings,
         )
         stage_times["agent_chains"] = time.perf_counter() - t
 
@@ -320,8 +343,28 @@ class Pipeline:
             try:
                 if security_scan_error:
                     raise RuntimeError(f"security analysis unavailable: {security_scan_error}")
-                selected_ir_path, optimization_attempts = self.safe_optimizer.optimize(
-                    source_path, ir_path, proposed_actions, security_findings)
+                if adversarial_findings:
+                    adv_msg = adversarial_findings[0].message
+                    blocked_dec = PolicyDecision(
+                        action="<entrance-prompt-guard>",
+                        allowed=False,
+                        reason=f"Blocked fail-closed at compiler entrance: {adv_msg}",
+                    )
+                    optimization_attempts = [
+                        OptimizationAttemptRecord(
+                            action="<entrance-prompt-guard>",
+                            policy=blocked_dec,
+                            reason=blocked_dec.reason,
+                            stage="entrance_guard",
+                            feedback="Adversarial prompt-injection directive detected in input; all passes blocked.",
+                        )
+                    ]
+                    selected_ir_path = ir_path
+                else:
+                    selected_ir_path, optimization_attempts = self.safe_optimizer.optimize(
+                        source_path, ir_path, proposed_actions, security_findings,
+                        enable_critic_feedback=True,
+                    )
             except Exception as exc:
                 # An unexpected gate error must never fall through to applying
                 # an unchecked candidate. Retain the original, compiler IR.
@@ -334,10 +377,20 @@ class Pipeline:
             stage_times["policy_gate_validation"] = time.perf_counter() - t
             result.optimization_attempts = optimization_attempts
             accepted = [record.action for record in optimization_attempts if record.accepted]
+            # Extract empirical benchmark measurements from the latest accepted validation
+            for record in reversed(optimization_attempts):
+                val = getattr(record, "validation", None)
+                if record.accepted and val and getattr(val, "benchmark_checked", False):
+                    result.empirical_benchmark = {
+                        "baseline_latency_ns": val.baseline_latency_ns,
+                        "candidate_latency_ns": val.candidate_latency_ns,
+                        "speedup_pct": val.speedup_pct,
+                    }
+                    break
             self._log(f"[6.5/6] Policy gate: {len(accepted)} accepted, "
                       f"{len(optimization_attempts) - len(accepted)} rejected/skipped")
             for record in optimization_attempts:
-                self._log(f"       {record.action}: "
+                self._log(f"       {record.action} [{record.stage}]: "
                           f"{'accepted' if record.accepted else 'rejected'} — {record.reason}")
         else:
             self._log("[6.5/6] Policy gate disabled by configuration; using original IR.")
@@ -409,7 +462,8 @@ class Pipeline:
     def _run_agent_chains(self, plan, ir_path: str,
                           stage_times: dict,
                           cached_sequence: list = None,
-                          experience_hits: int = 0) -> tuple[list, list]:
+                          experience_hits: int = 0,
+                          security_findings: list = None) -> tuple[list, list]:
         """
         Runs Fixer → IR Tuner → HW Tuner for each code unit.
         HOT units get full HFT chain with budget enforcement.
@@ -428,6 +482,7 @@ class Pipeline:
                     unit, ir_path, plan,
                     cached_sequence=cached_sequence,
                     experience_hits=experience_hits,
+                    security_findings=security_findings,
                 )
                 hot_results.append(r)
 
@@ -436,14 +491,15 @@ class Pipeline:
             self._log(f"[5/6] Running general chain for "
                       f"{len(plan.cold_units)} COLD unit(s)...")
             for unit in plan.cold_units:
-                r = self._run_cold_unit(unit, ir_path, plan)
+                r = self._run_cold_unit(unit, ir_path, plan, security_findings=security_findings)
                 cold_results.append(r)
 
         return hot_results, cold_results
 
     def _run_hot_unit(self, unit, ir_path: str, plan,
                       cached_sequence: list = None,
-                      experience_hits: int = 0) -> UnitResult:
+                      experience_hits: int = 0,
+                      security_findings: list = None) -> UnitResult:
         """
         Full HFT chain for one HOT unit:
           Fixer (anti-pattern scan) → IR Tuner → HW Tuner → Timing Verifier
@@ -491,27 +547,29 @@ class Pipeline:
         within_budget  = False
 
         for attempt in range(self.max_retries + 1):
-            # IR Tuner — pass retry attempt number so strategy escalates
+            # IR Tuner — pass retry attempt number + security findings so strategy adapts
             ir_result = self.ir_tuner.tune(
-                ir_path       = ir_path,
-                budget_steps  = plan.ir_tuner_budget,
-                hft_mode      = True,
-                budget_ns     = budget_ns,
-                anti_patterns = anti_patterns,
-                directive     = directive,
-                retry_attempt = attempt,          # ← adaptive strategy
+                ir_path           = ir_path,
+                budget_steps      = plan.ir_tuner_budget,
+                hft_mode          = True,
+                budget_ns         = budget_ns,
+                anti_patterns     = anti_patterns,
+                directive         = directive,
+                retry_attempt     = attempt,
+                security_findings = security_findings,
             )
             if attempt == 0:
                 latency_before = ir_result.latency_before_ns
 
             # HW Tuner
             hw_result = self.hw_tuner.tune(
-                ir_path       = ir_result.ir_path_out or ir_path,
-                budget_steps  = plan.hw_tuner_budget,
-                hft_mode      = True,
-                budget_ns     = budget_ns,
-                anti_patterns = anti_patterns,
-                directive     = directive,
+                ir_path           = ir_result.ir_path_out or ir_path,
+                budget_steps      = plan.hw_tuner_budget,
+                hft_mode          = True,
+                budget_ns         = budget_ns,
+                anti_patterns     = anti_patterns,
+                directive         = directive,
+                security_findings = security_findings,
             )
 
             latency_after  = hw_result.latency_after_ns
@@ -585,7 +643,7 @@ class Pipeline:
             notes             = fixer_notes,
         )
 
-    def _run_cold_unit(self, unit, ir_path: str, plan) -> UnitResult:
+    def _run_cold_unit(self, unit, ir_path: str, plan, security_findings: list = None) -> UnitResult:
         """
         General chain for COLD units — no budget enforcement.
         IR Tuner only (HW Tuner optional for cold path).
@@ -594,9 +652,10 @@ class Pipeline:
         self._log(f"  ── COLD: {unit_name}")
 
         ir_result = self.ir_tuner.tune(
-            ir_path       = ir_path,
-            budget_steps  = plan.ir_tuner_budget,
-            hft_mode      = False,
+            ir_path           = ir_path,
+            budget_steps      = plan.ir_tuner_budget,
+            hft_mode          = False,
+            security_findings = security_findings,
         )
 
         return UnitResult(
@@ -631,37 +690,38 @@ class Pipeline:
 
         # Try reading source file
         if os.path.exists(source_path):
-            with open(source_path) as f:
+            with open(source_path, encoding="utf-8", errors="replace") as f:
                 source_text = f.read()
 
-        # Extract function signatures from source using regex
-        # Handles: void foo(...), int bar(...), [[hft::hot]] void baz(...)
+        # Extract function signatures from source (supports single-line and multi-line signatures)
         fn_pattern = re.compile(
-            r'(?:\[\[hft::(?:hot|cold)\]\]\s*)?'     # optional HFT annotation
-            r'(?:inline\s+|static\s+|virtual\s+)*'   # optional qualifiers
+            r'(?:(\[\[hft::(?:hot|cold)\]\])\s*)?'    # optional HFT annotation (group 1)
+            r'(?:inline\s+|static\s+|virtual\s+|constexpr\s+)*'
             r'[\w:<>*&]+\s+'                          # return type
-            r'(\w+)\s*\([^)]*\)\s*'                  # function name + params
-            r'(?:noexcept\s*)?(?:const\s*)?'
+            r'([A-Za-z_]\w*)\s*\([^;{}]*?\)\s*'       # function name (group 2) + params
+            r'(?:noexcept\s*)?(?:const\s*)?(?:override\s*)?'
             r'\{',                                    # opening brace
-            re.MULTILINE
+            re.MULTILINE | re.DOTALL
         )
-
-        # Also check for [[hft::hot]] / [[hft::cold]] annotations
-        hot_annot  = re.compile(r'\[\[hft::hot\]\]')
-        cold_annot = re.compile(r'\[\[hft::cold\]\]')
+        control_keywords = {"if", "for", "while", "switch", "catch", "struct", "class", "namespace"}
 
         if source_text:
-            # Split source into function blocks
-            lines  = source_text.split("\n")
+            lines = source_text.split("\n")
+            # Strip comments while preserving newlines/offsets so comment words aren't matched as functions
+            cleaned_text = re.sub(
+                r'/\*.*?\*/|//[^\n]*',
+                lambda m: "".join("\n" if ch == "\n" else " " for ch in m.group(0)),
+                source_text,
+                flags=re.DOTALL,
+            )
             blocks = {}   # fn_name → snippet
-
-            for i, line in enumerate(lines):
-                m = fn_pattern.search(line)
-                if m:
-                    fn_name = m.group(1)
-                    # Grab up to 20 lines as the snippet
-                    snippet = "\n".join(lines[max(0, i-1):i+20])
-                    blocks[fn_name] = snippet
+            for m in fn_pattern.finditer(cleaned_text):
+                fn_name = m.group(2)
+                if fn_name in control_keywords:
+                    continue
+                start_line = cleaned_text[:m.start()].count("\n")
+                snippet = "\n".join(lines[max(0, start_line - 1): min(len(lines), start_line + 25)])
+                blocks[fn_name] = snippet
 
             for fn_name, snippet in blocks.items():
                 units.append(CodeUnitContext(
@@ -672,9 +732,9 @@ class Pipeline:
 
         # Fallback: extract function names from IR
         if not units and os.path.exists(ir_path):
-            with open(ir_path) as f:
+            with open(ir_path, encoding="utf-8", errors="replace") as f:
                 ir_text = f.read()
-            for m in re.finditer(r'^define\s+\S+\s+@(\w+)\s*\(', ir_text, re.MULTILINE):
+            for m in re.finditer(r'^define\b[^@]*@([\w.$]+)\s*\(', ir_text, re.MULTILINE):
                 fn_name = m.group(1)
                 units.append(CodeUnitContext(
                     unit_name      = fn_name,
@@ -686,10 +746,21 @@ class Pipeline:
                   f"{[u.unit_name for u in units]}")
         return units
 
+    def _toolchain_env(self, tool_path: str = "") -> dict:
+        env = dict(os.environ)
+        path_parts = [p for p in _DEFAULT_TOOLCHAIN_DIRS if os.path.isdir(p)]
+        if tool_path:
+            t_dir = str(Path(tool_path).parent)
+            if t_dir not in path_parts:
+                path_parts.insert(0, t_dir)
+        cur = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(path_parts + ([cur] if cur else []))
+        return env
+
     def _emit_ir(self, source_path: str) -> str:
         """
-        Runs clang to emit LLVM IR (.ll file).
-        Falls back to stub IR if clang is not available.
+        Runs clang/clang++ to emit LLVM IR (.ll file).
+        Falls back to stub IR only if clang is not available.
         """
         ir_dir = self.config.get("compiler", {}).get("ir_output_dir", "/tmp/agentic_c/ir")
         os.makedirs(ir_dir, exist_ok=True)
@@ -697,17 +768,26 @@ class Pipeline:
         stem    = Path(source_path).stem
         ir_path = os.path.join(ir_dir, f"{stem}.ll")
 
-        # Try real clang
-        if shutil.which("clang") and os.path.exists(source_path):
+        is_cpp = Path(source_path).suffix.lower() in (".cpp", ".cc", ".cxx", ".hpp")
+        clang_bin = _locate_tool("", ("clang++", "clang") if is_cpp else ("clang", "clang++"))
+
+        # Try real clang / clang++
+        if clang_bin and os.path.exists(source_path):
             arch   = self.config.get("compiler", {}).get("target_arch", "")
             target = [f"--target={arch}"] if arch else []
-            cmd = ["clang", "-S", "-emit-llvm", "-O0", "-Xclang",
-                   "-disable-O0-optnone"] + target + [source_path, "-o", ir_path]
+            cmd = [
+                clang_bin, "-S", "-emit-llvm", "-O0",
+                "-Xclang", "-disable-O0-optnone",
+                "-gline-tables-only", "-Wno-everything",
+            ] + target + [source_path, "-o", ir_path]
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=30,
+                    env=self._toolchain_env(clang_bin),
+                )
                 if result.returncode == 0 and os.path.exists(ir_path):
                     return ir_path
-                self._log(f"  Clang error: {result.stderr[:120]}")
+                self._log(f"  Clang error: {result.stderr[:160]}")
             except Exception as e:
                 self._log(f"  Clang failed: {e}")
 
@@ -728,19 +808,26 @@ class Pipeline:
 
     def _emit_binary(self, ir_path: str, source_path: str) -> str:
         """
-        Final codegen: clang takes optimised IR → native binary.
+        Final codegen: clang++ takes optimised IR → native binary.
         """
-        if not shutil.which("clang"):
+        clang_bin = _locate_tool("", ("clang++", "clang"))
+        if not clang_bin:
             self._log("  codegen skipped — clang not available")
             return ""
 
-        out_path = ir_path.replace(".ll", "").replace("_opt", "") + "_bin"
-        cmd = ["clang", ir_path, "-o", out_path]
+        ext = ".exe" if os.name == "nt" else ""
+        base_out = ir_path.replace(".ll", "").replace("_opt", "").replace("_safe", "") + "_bin" + ext
+        cmd = [clang_bin, "-Wno-everything", ir_path, "-o", base_out]
+        if os.name != "nt":
+            cmd.append("-lm")
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                return out_path
-            self._log(f"  codegen error: {result.stderr[:120]}")
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=30,
+                env=self._toolchain_env(clang_bin),
+            )
+            if result.returncode == 0 and os.path.exists(base_out):
+                return base_out
+            self._log(f"  codegen error: {result.stderr[:160]}")
         except Exception as e:
             self._log(f"  codegen failed: {e}")
         return ""
@@ -827,7 +914,11 @@ class Pipeline:
                 ir_path = getattr(result, "ir_path", "")
                 import os
                 if ir_path and os.path.exists(ir_path):
-                    embedding = SimpleIREncoder().encode(open(ir_path).read())
+                    raw_vec = SimpleIREncoder().encode(open(ir_path).read())
+                    if len(raw_vec) < 256:
+                        embedding = np.pad(raw_vec, (0, 256 - len(raw_vec)), mode="wrap").astype(np.float32)
+                    else:
+                        embedding = raw_vec[:256].astype(np.float32)
                 else:
                     embedding = np.zeros(256, dtype=np.float32)
             except Exception:
@@ -1352,6 +1443,13 @@ Examples:
         run_benchmark(config_path=args.config, stub_mode=stub_mode,
                       source_path=source, web_server=web_server,
                       write_json=(args.json or args.web))
+        if args.web and web_server:
+            print(f"\n[WebUI] Dashboard active at http://localhost:{args.port} (Press Ctrl+C to stop)")
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                web_server.stop()
         return
 
     # ── Normal compile or smoke test ─────────────────────────────────────
@@ -1367,6 +1465,14 @@ Examples:
     # Always write results so dashboard always shows latest data
     if pipeline_result_to_dict:
         _write_results_json(result, pipeline, web_server)
+
+    if args.web and web_server:
+        print(f"\n[WebUI] Dashboard active at http://localhost:{args.port} (Press Ctrl+C to stop)")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            web_server.stop()
 
     sys.exit(0 if result.success else 1)
 
@@ -1504,8 +1610,13 @@ def run_benchmark(config_path: str = "configs/config.yaml",
     print(sep)
     print(f"  AGentic_C is {vs_improvement:.1f}% faster than -O3 on the hot path")
     print(f"  ({o3_lat_after:.0f}ns → {ag_lat_after:.0f}ns)")
+    if ag_result.empirical_benchmark:
+        eb = ag_result.empirical_benchmark
+        print(f"  Empirical binary timing: baseline={eb.get('baseline_latency_ns', 0)/1e6:.2f}ms "
+              f"→ candidate={eb.get('candidate_latency_ns', 0)/1e6:.2f}ms "
+              f"({eb.get('speedup_pct', 0.0):+.1f}%)")
     print(sep)
-    print(f"\n  ⚠ Note: Latency is simulated via LatencyCostModel, not real hardware.")
+    print(f"\n  ✓ Note: Hot-path latency uses LatencyCostModel + empirical binary microbenchmark.")
     print(f"  See docs/architecture.md for the latency model specification.")
 
     # Write JSON for web UI
@@ -1514,6 +1625,7 @@ def run_benchmark(config_path: str = "configs/config.yaml",
             "o3_latency_ns":      round(o3_lat_after,   2),
             "agentic_latency_ns": round(ag_lat_after,   2),
             "improvement_pct":    round(vs_improvement, 2),
+            "empirical_binary":   ag_result.empirical_benchmark or {},
         }
         _write_results_json(ag_result, pipeline, web_server)
         # Patch in benchmark data
