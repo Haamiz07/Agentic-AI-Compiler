@@ -252,6 +252,77 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
             finally:
                 server.stop()
 
+    def test_08_web_ui_path_traversal_rejection(self):
+        """Web UI rejects path traversal (../) and absolute paths outside approved directories for both read and compile."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            res_path = str(Path(tmp) / "results.json")
+            Path(res_path).write_text(json.dumps({"success": True}), encoding="utf-8")
+            server = WebUIServer(results_path=res_path, port=15060)
+            started = server.start()
+            self.assertTrue(started)
+            try:
+                # 1. Traversal attempt with ../ in source reading
+                url_dotdot = "http://127.0.0.1:15060/api/source?file=../../configs/config.yaml"
+                try:
+                    urllib.request.urlopen(url_dotdot, timeout=5)
+                    self.fail("Expected HTTPError 403 for path traversal in /api/source")
+                except urllib.error.HTTPError as err:
+                    self.assertEqual(err.code, 403)
+                    body = json.loads(err.read().decode("utf-8"))
+                    self.assertFalse(body["ok"])
+                    self.assertIn("Access denied", body["error"])
+
+                # 2. Absolute path outside project in source reading
+                abs_path = "C:/Windows/win.ini" if os.name == "nt" else "/etc/passwd"
+                url_abs = f"http://127.0.0.1:15060/api/source?file={abs_path}"
+                try:
+                    urllib.request.urlopen(url_abs, timeout=5)
+                    self.fail("Expected HTTPError 403 for absolute path outside project in /api/source")
+                except urllib.error.HTTPError as err:
+                    self.assertEqual(err.code, 403)
+                    body = json.loads(err.read().decode("utf-8"))
+                    self.assertFalse(body["ok"])
+                    self.assertIn("Access denied", body["error"])
+
+                # 3. Traversal attempt in /api/compile (should not read or compile)
+                req_dotdot = urllib.request.Request(
+                    "http://127.0.0.1:15060/api/compile",
+                    data=json.dumps({"filename": "../../outside.cpp"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                try:
+                    urllib.request.urlopen(req_dotdot, timeout=5)
+                    self.fail("Expected HTTPError 403 for path traversal in /api/compile")
+                except urllib.error.HTTPError as err:
+                    self.assertEqual(err.code, 403)
+                    body = json.loads(err.read().decode("utf-8"))
+                    self.assertFalse(body["ok"])
+                    self.assertIn("Access denied", body["error"])
+
+                # 4. Absolute path outside project in /api/compile
+                req_abs = urllib.request.Request(
+                    "http://127.0.0.1:15060/api/compile",
+                    data=json.dumps({"filename": abs_path}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                try:
+                    urllib.request.urlopen(req_abs, timeout=5)
+                    self.fail("Expected HTTPError 403 for absolute path in /api/compile")
+                except urllib.error.HTTPError as err:
+                    self.assertEqual(err.code, 403)
+                    body = json.loads(err.read().decode("utf-8"))
+                    self.assertFalse(body["ok"])
+                    self.assertIn("Access denied", body["error"])
+
+                # 5. Valid approved example file continues to work
+                with urllib.request.urlopen("http://127.0.0.1:15060/api/source?file=examples/market_maker.cpp", timeout=5) as r:
+                    self.assertEqual(r.status, 200)
+                    resp = json.loads(r.read().decode("utf-8"))
+                    self.assertTrue(resp["ok"])
+                    self.assertIn("on_book_update", resp["source_code"])
+            finally:
+                server.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

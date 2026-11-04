@@ -18,10 +18,12 @@ import os
 import sys
 import json
 import time
+import tempfile
 import threading
 import webbrowser
 import http.server
 import socketserver
+from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
@@ -101,28 +103,87 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as exc:
             self.send_error(500, str(exc))
 
+    @staticmethod
+    def _validate_approved_path(requested: str, root_dir: Path) -> Optional[Path]:
+        """
+        Validate that the requested path strictly resolves within approved source directories
+        (examples/ or live edited sources). Explicitly rejects any '..' directory traversal
+        or external absolute paths.
+        """
+        if not requested or not isinstance(requested, str):
+            return None
+        raw_str = requested.strip()
+        if not raw_str:
+            return None
+
+        # Explicitly reject '..' traversal components upfront
+        raw_parts = Path(raw_str).parts
+        if ".." in raw_parts:
+            return None
+
+        raw_path = Path(raw_str)
+        if raw_path.is_absolute():
+            cand = raw_path.resolve()
+        else:
+            # Check relative to examples/ first, then relative to root_dir
+            ex_cand = (root_dir / "examples" / raw_path).resolve()
+            if ex_cand.is_file():
+                cand = ex_cand
+            else:
+                cand = (root_dir / raw_path).resolve()
+
+        approved_dirs = [
+            (root_dir / "examples").resolve(),
+            Path("/tmp/agentic_c/live_sources").resolve(),
+            (Path(tempfile.gettempdir()) / "agentic_c" / "live_sources").resolve(),
+        ]
+
+        for app_dir in approved_dirs:
+            try:
+                cand.relative_to(app_dir)
+                return cand
+            except ValueError:
+                continue
+        return None
+
     def _serve_source(self, params: dict):
         """Return available example C/C++ files and the source text of the requested file."""
         root_dir = SRC_DIR.parent
-        examples_dir = root_dir / "examples"
+        examples_dir = (root_dir / "examples").resolve()
         files = []
         if examples_dir.is_dir():
             files = [f"examples/{p.name}" for p in sorted(examples_dir.glob("*.cpp")) + sorted(examples_dir.glob("*.c"))]
-        requested = (
+
+        raw_requested = (
             params.get("file", [None])[0]
             or params.get("path", [None])[0]
-            or self._latest_source_path()
-            or (files[0] if files else "examples/market_maker.cpp")
         )
-        cand = Path(requested)
-        if not cand.is_absolute():
-            cand = (root_dir / cand).resolve()
+        if raw_requested:
+            valid_path = self._validate_approved_path(raw_requested, root_dir)
+            if not valid_path or not valid_path.is_file():
+                self._send_json({
+                    "ok": False,
+                    "error": f"Access denied: Requested path '{raw_requested}' is outside approved source directories.",
+                    "file": str(raw_requested),
+                    "available_files": files,
+                    "source_code": "",
+                }, status=403)
+                return
+            cand = valid_path
+            rel_file = str(raw_requested)
+        else:
+            latest = self._latest_source_path()
+            cand = self._validate_approved_path(latest, root_dir) if latest else None
+            if not cand or not cand.is_file():
+                cand = (examples_dir / "market_maker.cpp").resolve() if examples_dir.is_dir() else None
+            rel_file = f"examples/{cand.name}" if cand else "examples/market_maker.cpp"
+
         source_code = ""
-        if cand.is_file():
+        if cand and cand.is_file():
             source_code = cand.read_text(encoding="utf-8", errors="replace")
         self._send_json({
             "ok": bool(source_code),
-            "file": str(requested),
+            "file": rel_file,
             "available_files": files,
             "source_code": source_code,
         })
@@ -138,19 +199,29 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
 
         root_dir = SRC_DIR.parent
         if isinstance(source_code, str) and source_code.strip():
-            live_dir = Path("/tmp/agentic_c/live_sources")
-            live_dir.mkdir(parents=True, exist_ok=True)
             safe_name = Path(filename).name
+            if not safe_name or ".." in Path(filename).parts:
+                self._send_json({
+                    "ok": False,
+                    "error": f"Access denied: Invalid filename '{filename}'.",
+                }, status=403)
+                return
             if not safe_name.endswith((".cpp", ".c", ".cc", ".cxx")):
                 safe_name += ".cpp"
+            live_dir = Path("/tmp/agentic_c/live_sources").resolve()
+            live_dir.mkdir(parents=True, exist_ok=True)
             target_path = live_dir / safe_name
             target_path.write_text(source_code, encoding="utf-8")
             compile_target = str(target_path)
         else:
-            cand = Path(filename)
-            if not cand.is_absolute():
-                cand = (root_dir / cand).resolve()
-            compile_target = str(cand)
+            valid_path = self._validate_approved_path(filename, root_dir)
+            if not valid_path or not valid_path.is_file():
+                self._send_json({
+                    "ok": False,
+                    "error": f"Access denied: File '{filename}' is outside approved source directories.",
+                }, status=403)
+                return
+            compile_target = str(valid_path)
 
         from pipeline import Pipeline, _HOTNESS_CACHE
         pipe = Pipeline(config_path=str(root_dir / "configs" / "config.yaml"), stub_mode=True)
@@ -164,9 +235,9 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
             json.dump(d, f, indent=2)
         self._send_json({"ok": True, "results": d})
 
-    def _send_json(self, payload):
+    def _send_json(self, payload, status=200):
         data = json.dumps(payload).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
