@@ -17,6 +17,7 @@ compiler:
 # ------------------------------------------------------------
 policy_gate:
   enabled: true
+  entrance_prompt_guard: true
   opt_path: ""                    # empty = find `opt` on PATH
   timeout_s: 30
   max_passes_per_compile: 12
@@ -43,10 +44,12 @@ validation:
   clang_path: ""                  # empty = find `clang` on PATH
   timeout_s: 20
   require_behavior_checks: true   # keep true for acceptance based on evidence
-  # The bundled examples do not read stdin; EOF is their smoke-test input.
-  # Replace/add representative inputs when compiling programs that read stdin.
+  benchmark_runs: 5
+  # Representative behavior fixtures tested against baseline and candidate binaries.
   behavior_inputs:
     - ""
+    - "100\n"
+    - "1000 250 5\n"
 
 # ------------------------------------------------------------
 # Pipeline mode

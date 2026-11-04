@@ -37,6 +37,9 @@ class ValidationResult:
     behavior_checked: bool = False
     behavior_preserved: Optional[bool] = None
     benchmark_checked: bool = False
+    baseline_latency_ns: Optional[float] = None
+    candidate_latency_ns: Optional[float] = None
+    speedup_pct: Optional[float] = None
     baseline_ir: str = ""
     candidate_ir: str = ""
     details: list[str] = field(default_factory=list)
@@ -54,6 +57,8 @@ class OptimizationAttemptRecord:
     accepted: bool = False
     validation: Optional[ValidationResult] = None
     reason: str = ""
+    stage: str = "pipeline"
+    feedback: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -63,4 +68,6 @@ class OptimizationAttemptRecord:
             "accepted": self.accepted,
             "validation": self.validation.to_dict() if self.validation else None,
             "reason": self.reason,
+            "stage": self.stage,
+            "feedback": self.feedback,
         }

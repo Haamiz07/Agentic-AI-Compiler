@@ -339,17 +339,21 @@ function renderSafetyReview(data) {
         : (item.executed ? 'Validation not completed' : 'Not executed');
       const reason = item.reason || policy.reason || 'No explanation recorded.';
       const checks = validation
-        ? `<div class="safety-meta">Compiled: ${validation.compile_success ? 'yes' : 'no'} · Behavior checked: ${validation.behavior_checked ? 'yes' : 'no'}${validation.behavior_checked ? ` · Same output: ${validation.behavior_preserved ? 'yes' : 'no'}` : ''}</div>`
+        ? `<div class="safety-meta">Compiled: ${validation.compile_success ? 'yes' : 'no'} · Behavior checked: ${validation.behavior_checked ? 'yes' : 'no'}${validation.behavior_checked ? ` · Same output: ${validation.behavior_preserved ? 'yes' : 'no'}` : ''}${validation.speedup_pct != null ? ` · Empirical Δ: ${validation.speedup_pct >= 0 ? '+' : ''}${Number(validation.speedup_pct).toFixed(1)}%` : ''}</div>`
         : '';
+      const stageTag = item.stage ? `<span class="safety-badge">${esc(item.stage)}</span>` : '';
+      const feedbackHtml = item.feedback ? `<div class="safety-meta" style="color:var(--accent)">Critic feedback: ${esc(item.feedback)}</div>` : '';
       return `
         <article class="safety-item ${acceptedAction ? 'status-accepted' : 'status-rejected'}">
           <div class="safety-item-header">
             <span class="safety-code">${esc(item.action || 'unknown action')}</span>
             <span class="safety-badge ${acceptedAction ? 'badge-accepted' : 'badge-rejected'}">${acceptedAction ? 'Accepted' : 'Not accepted'}</span>
+            ${stageTag}
           </div>
           <div class="safety-meta">${esc(policyLabel)} · ${esc(validationLabel)}</div>
           <div class="safety-reason">${esc(reason)}</div>
           ${checks}
+          ${feedbackHtml}
         </article>`;
     }).join('') : '<div class="safety-empty">No pass decisions recorded for this run. Run a fresh compile to populate this panel.</div>';
   }
@@ -529,8 +533,97 @@ function scoreFromImprovement(pct) {
   return 40;
 }
 
+/* ── Interactive Source Editor & Live Compiler ──────────────────────── */
+async function loadSourceIntoEditor(requestedFile) {
+  const selectEl = document.getElementById('sourceSelect');
+  const editorEl = document.getElementById('sourceEditor');
+  if (!selectEl || !editorEl) return;
+  const target = requestedFile || selectEl.value || '';
+  try {
+    const url = '/api/source' + (target ? `?file=${encodeURIComponent(target)}` : '');
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const data = await res.json();
+    const files = Array.isArray(data.available_files) ? data.available_files : [];
+    if (selectEl.options.length === 0 && files.length > 0) {
+      selectEl.innerHTML = files.map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join('');
+    }
+    if (data.file && files.includes(data.file)) {
+      selectEl.value = data.file;
+    }
+    if (typeof data.source_code === 'string') {
+      editorEl.value = data.source_code;
+    }
+  } catch (err) {
+    console.error('Failed to load source:', err);
+  }
+}
+
+async function compileFromEditor() {
+  const selectEl = document.getElementById('sourceSelect');
+  const editorEl = document.getElementById('sourceEditor');
+  const btnEl    = document.getElementById('btnCompileSource');
+  const msgEl    = document.getElementById('compileStatusMsg');
+  if (!editorEl) return;
+
+  const filename = (selectEl && selectEl.value) ? selectEl.value : 'examples/market_maker.cpp';
+  const sourceCode = editorEl.value;
+
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = '⏳ Compiling…';
+  }
+  if (msgEl) {
+    msgEl.style.display = 'block';
+    msgEl.textContent = `Running Clang frontend, SecurityAnalyzer, Boss/Fixer/IRTuner/HWTuner agents, PolicyGate, LLVM opt, and CandidateValidator on ${filename}…`;
+  }
+  setStatus('running', 'Compiling & validating candidate IR…');
+
+  try {
+    const res = await fetch('/api/compile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename,
+        source_code: sourceCode,
+        emit_binary: true,
+      }),
+    });
+    const data = await res.json();
+    if (data && data.ok && data.results) {
+      lastData = data.results;
+      render(data.results);
+      const acc = (data.results.optimization_attempts || []).filter(a => a && a.accepted).length;
+      const tot = (data.results.optimization_attempts || []).length;
+      const emp = data.results.empirical_benchmark || {};
+      const empInfo = emp.speedup_pct != null ? ` · Empirical binary Δ: ${emp.speedup_pct >= 0 ? '+' : ''}${Number(emp.speedup_pct).toFixed(1)}%` : '';
+      if (msgEl) {
+        msgEl.innerHTML = `<span style="color:var(--green);font-weight:600">✓ Compilation complete</span> — ${acc}/${tot} LLVM passes verified &amp; accepted${esc(empInfo)}.`;
+      }
+    } else {
+      if (msgEl) {
+        msgEl.innerHTML = `<span style="color:var(--red)">✗ Compilation failed</span>`;
+      }
+    }
+  } catch (err) {
+    if (msgEl) {
+      msgEl.innerHTML = `<span style="color:var(--red)">✗ Error: ${esc(err.message)}</span>`;
+    }
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = '⚡ Compile & Optimize';
+    }
+  }
+}
+
 /* ── Start polling ──────────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
   fetchResults();
+  loadSourceIntoEditor();
+  const selectEl = document.getElementById('sourceSelect');
+  if (selectEl) {
+    selectEl.addEventListener('change', (e) => loadSourceIntoEditor(e.target.value));
+  }
   pollTimer = setInterval(fetchResults, POLL_INTERVAL);
 });

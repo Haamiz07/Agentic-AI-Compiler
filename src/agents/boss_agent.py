@@ -156,6 +156,7 @@ class CompilationContext:
     latency_budget:     Optional[LatencyBudget] = None
     hardware_profile:   Optional[HardwareProfile] = None
     code_units:         list = field(default_factory=list)  # List[CodeUnitContext]
+    security_findings:  list = field(default_factory=list)  # List[SecurityFinding]
 
 
 @dataclass
@@ -191,6 +192,7 @@ class CompilationPlan:
     hft_chain_active:   bool  = False               # True when routing hot path units
     hot_units:          list  = field(default_factory=list)   # List[CodeUnitContext]
     cold_units:         list  = field(default_factory=list)   # List[CodeUnitContext]
+    security_summary:   dict  = field(default_factory=dict)   # Planner security constraints
 
 
 # ---------------------------------------------------------------------------
@@ -885,9 +887,11 @@ class BossAgent:
                 else:
                     self._log("Memory-informed plan applied (no past passes to reuse).")
 
-                # Still apply HFT unit routing on top of memory plan
+                # Still apply HFT unit routing and security overlay on top of memory plan
                 if context.hft_mode:
                     plan = self._apply_hft_routing(plan, context)
+                if getattr(context, "security_findings", None):
+                    plan = self._apply_security_overlay(plan, context)
                 return plan
 
         # --- Budget allocation ---
@@ -912,6 +916,35 @@ class BossAgent:
         if context.hft_mode:
             plan = self._apply_hft_routing(plan, context)
 
+        # --- Security-informed routing overlay ---
+        if getattr(context, "security_findings", None):
+            plan = self._apply_security_overlay(plan, context)
+
+        return plan
+
+    def _apply_security_overlay(self, plan: CompilationPlan,
+                                context: CompilationContext) -> CompilationPlan:
+        try:
+            from safety.analysis import SecurityAnalyzer
+        except ImportError:
+            from src.safety.analysis import SecurityAnalyzer
+        sec_summary = SecurityAnalyzer.summarize_for_planner(context.security_findings)
+        plan.security_summary = sec_summary
+        if sec_summary.get("high_severity_count", 0) > 0:
+            plan.pre_fixer_focus = "both"
+            plan.post_fixer_focus = "security"
+        prefer = sec_summary.get("prefer_passes", [])
+        avoid = sec_summary.get("avoid_passes", [])
+        sec_directive = (
+            f"Security findings={sec_summary.get('finding_count', 0)} "
+            f"(high={sec_summary.get('high_severity_count', 0)}): "
+            f"prefer passes {prefer}; avoid {avoid}."
+        )
+        plan.ir_tuner_directive = (
+            f"{plan.ir_tuner_directive} | {sec_directive}".strip(" |")
+            if plan.ir_tuner_directive else sec_directive
+        )
+        self._log(f"Security-informed plan updated: {sec_directive}")
         return plan
 
     def _apply_hft_routing(self, plan: CompilationPlan,
