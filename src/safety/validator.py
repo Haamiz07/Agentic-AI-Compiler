@@ -94,46 +94,62 @@ class CandidateValidator:
         return funcs
 
     @staticmethod
-    def _zero_store_bytes_by_dest(ir_body: str) -> dict[str, int]:
-        """Map each store destination (including simple GEP bases) to total zero-stored bytes."""
-        type_sizes = {
-            "i1": 1, "i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16,
-            "half": 2, "float": 4, "double": 8, "ptr": 8,
-        }
-        # Track simple GEP aliases: %gep = getelementptr ..., ptr %base, ...
-        alias_to_base: dict[str, str] = {}
-        for m in re.finditer(
-            r"^\s*(%[\w.$]+)\s*=\s*(?:getelementptr|bitcast|addrspacecast)\b[^\n]*?\bptr\s+([%@][\w.$]+)",
-            ir_body,
-            re.MULTILINE,
-        ):
-            alias_to_base[m.group(1)] = m.group(2)
+    def _zero_store_bytes_by_dest(ir_body: str) -> dict[str, list[int]]:
+        """Map exact pointer expressions to integer zero-store widths, retaining GEP offsets."""
+        def integer_bytes(ty: str) -> int:
+            return (int(ty[1:]) + 7) // 8
 
-        def _root(sym: str) -> str:
-            seen: set[str] = set()
-            cur = sym
-            while cur in alias_to_base and cur not in seen:
-                seen.add(cur)
-                cur = alias_to_base[cur]
-            return cur
+        def pointer_key(sym: str) -> str:
+            return CandidateValidator._pointer_expression_key(ir_body, sym)
 
-        totals: dict[str, int] = {}
-        # Scalar zero stores: store <ty> 0|null|zeroinitializer, ptr <dest>
+        widths: dict[str, list[int]] = {}
+        # Only integer zero stores prove an all-bits-zero byte write. Null pointers
+        # and floating zero are excluded because their bit representation is target-specific.
         for m in re.finditer(
-            r"\bstore\s+(i\d+|half|float|double|ptr)\s+(?:0|0\.0+e[+-]\d+|0\.0|null|zeroinitializer)\s*,\s*ptr\s+([%@][\w.$]+)",
+            r"\bstore\s+(i\d+)\s+0\s*,\s*ptr\s+([%@][\w.$]+)",
             ir_body,
         ):
-            dest = _root(m.group(2))
-            totals[dest] = totals.get(dest, 0) + type_sizes.get(m.group(1), 4)
-        # Vector zero stores: store <N x ty> zeroinitializer, ptr <dest>
+            dest = pointer_key(m.group(2))
+            widths.setdefault(dest, []).append(integer_bytes(m.group(1)))
+        # Integer vector zero stores.
         for m in re.finditer(
-            r"\bstore\s+<\s*(\d+)\s*x\s*(i\d+|half|float|double|ptr)\s*>\s+zeroinitializer\s*,\s*ptr\s+([%@][\w.$]+)",
+            r"\bstore\s+<\s*(\d+)\s*x\s*(i\d+)\s*>\s+zeroinitializer\s*,\s*ptr\s+([%@][\w.$]+)",
             ir_body,
         ):
             lanes = int(m.group(1))
-            dest = _root(m.group(3))
-            totals[dest] = totals.get(dest, 0) + lanes * type_sizes.get(m.group(2), 4)
-        return totals
+            dest = pointer_key(m.group(3))
+            widths.setdefault(dest, []).append(lanes * integer_bytes(m.group(2)))
+        return widths
+
+    @staticmethod
+    def _pointer_expression_key(ir_body: str, sym: str) -> str:
+        """Canonicalize bitcasts and retain complete GEP indices in pointer identity."""
+        definitions = {
+            m.group(1): m.group(2)
+            for m in re.finditer(r"^\s*(%[\w.$]+)\s*=\s*(.*?)\s*$", ir_body, re.MULTILINE)
+        }
+
+        def resolve(value: str, seen: set[str]) -> str:
+            if value in seen:
+                return f"cycle:{value}"
+            seen.add(value)
+            rhs = definitions.get(value, "")
+            if rhs.startswith("bitcast "):
+                source = re.search(r"\bptr\s+([%@][\w.$]+)\s+to\s+ptr\b", rhs)
+                if source:
+                    return resolve(source.group(1), seen)
+            if rhs.startswith("getelementptr "):
+                gep = re.search(r"\bptr\s+([%@][\w.$]+)(.*)$", rhs)
+                if gep:
+                    indices = " ".join(gep.group(2).split())
+                    return f"gep:{resolve(gep.group(1), seen)}:{indices}"
+            if rhs:
+                # Keep the SSA identity so two same-shaped allocas/loads are not
+                # accidentally treated as the same address.
+                return f"ssa:{value}:{' '.join(rhs.split())}"
+            return value
+
+        return resolve(sym, set())
 
     @classmethod
     def check_security_invariants(cls, baseline_ir: str, candidate_ir: str) -> tuple[bool, str]:
@@ -162,57 +178,79 @@ class CandidateValidator:
         dest_pat = re.compile(r"([%@][\w.$]+)\s*$")
 
         for fn_name, base_body in base_funcs.items():
-            if fn_name.startswith(("_ZNSt", "_ZSt", "_ZNKSt")) or fn_name not in cand_funcs:
+            if fn_name.startswith(("_ZNSt", "_ZSt", "_ZNKSt")):
                 continue
-            cand_body = cand_funcs[fn_name]
             base_calls = memset_any_pat.findall(base_body)
+            if not base_calls:
+                continue
+            if fn_name not in cand_funcs:
+                return False, f"Rejected (CWE-14): Pass removed function '{fn_name}' containing memory-scrubbing call(s)."
+            cand_body = cand_funcs[fn_name]
             cand_calls = memset_any_pat.findall(cand_body)
-            if len(cand_calls) < len(base_calls):
-                # Map destination -> list of constant lengths in base and candidate
-                base_by_dest: dict[str, list[int]] = {}
-                for args in base_calls:
-                    m_len = const_len_pat.search(args)
-                    if not m_len:
-                        return False, (
-                            f"Rejected (CWE-14): Pass eliminated dynamic-length memory-scrubbing "
-                            f"memset call in '{fn_name}'."
-                        )
-                    first_arg = args.split(",", 1)[0]
-                    m_dst = dest_pat.search(first_arg.strip())
-                    dst = m_dst.group(1) if m_dst else "<unknown>"
-                    base_by_dest.setdefault(dst, []).append(int(m_len.group(1)))
+            remaining_candidate_calls = list(cand_calls)
+            base_zero = cls._zero_store_bytes_by_dest(base_body)
+            candidate_zero = cls._zero_store_bytes_by_dest(cand_body)
+            used_added_stores: dict[tuple[str, int], int] = {}
 
-                cand_by_dest: dict[str, list[int]] = {}
-                for args in cand_calls:
-                    m_len = const_len_pat.search(args)
-                    if m_len:
-                        first_arg = args.split(",", 1)[0]
-                        m_dst = dest_pat.search(first_arg.strip())
-                        dst = m_dst.group(1) if m_dst else "<unknown>"
-                        cand_by_dest.setdefault(dst, []).append(int(m_len.group(1)))
+            def parse_scrub(args: str, body: str) -> tuple[str, int | None, bool | None]:
+                length_match = const_len_pat.search(args)
+                first_arg = args.split(",", 1)[0].strip()
+                destination_match = dest_pat.search(first_arg)
+                volatile_match = re.search(r",\s*i1\s+(true|false)\s*$", args)
+                is_volatile = (
+                    volatile_match.group(1) == "true" if volatile_match else None
+                )
+                if not destination_match:
+                    return "<unknown>", int(length_match.group(1)) if length_match else None, is_volatile
+                destination = cls._pointer_expression_key(body, destination_match.group(1))
+                return destination, int(length_match.group(1)) if length_match else None, is_volatile
 
-                base_zero_dests = cls._zero_store_bytes_by_dest(base_body)
-                cand_zero_dests = cls._zero_store_bytes_by_dest(cand_body)
+            for base_args in base_calls:
+                base_dest, base_len, base_volatile = parse_scrub(base_args, base_body)
+                matching_index = None
+                for index, candidate_args in enumerate(remaining_candidate_calls):
+                    cand_dest, cand_len, cand_volatile = parse_scrub(candidate_args, cand_body)
+                    if base_len is not None and cand_len is not None:
+                        volatile_preserved = base_volatile is not True or cand_volatile is True
+                        if base_dest == cand_dest and base_len == cand_len and volatile_preserved:
+                            matching_index = index
+                            break
+                    elif " ".join(base_args.split()) == " ".join(candidate_args.split()):
+                        matching_index = index
+                        break
+                if matching_index is not None:
+                    remaining_candidate_calls.pop(matching_index)
+                    continue
 
-                for dst, base_lens in base_by_dest.items():
-                    cand_lens = cand_by_dest.get(dst, [])
-                    if len(cand_lens) >= len(base_lens) and sum(cand_lens) >= sum(base_lens):
-                        continue
-                    # Only allow scalar zero-store replacement for small (<=8B) constant wipes
-                    # when the added zero stores target the EXACT SAME destination pointer.
-                    if any(sz > 8 for sz in base_lens) or dst == "<unknown>":
-                        return False, (
-                            f"Rejected (CWE-14): Pass eliminated multi-byte (>8B) or untracked "
-                            f"memory-scrubbing memset on '{dst}' in '{fn_name}'."
-                        )
-                    removed_bytes = max(0, sum(base_lens) - sum(cand_lens))
-                    added_on_dst = max(0, cand_zero_dests.get(dst, 0) - base_zero_dests.get(dst, 0))
-                    if added_on_dst < removed_bytes:
-                        return False, (
-                            f"Rejected (CWE-14): Pass eliminated {removed_bytes}B memset on '{dst}' "
-                            f"in '{fn_name}' without matching zero-stores on '{dst}' "
-                            f"(only {added_on_dst}B on same destination)."
-                        )
+                if base_len is None or base_dest == "<unknown>":
+                    return False, (
+                        f"Rejected (CWE-14): Pass eliminated dynamic or untracked "
+                        f"memory-scrubbing memset in '{fn_name}'."
+                    )
+                if base_volatile is True:
+                    return False, (
+                        f"Rejected (CWE-14): Pass removed a volatile memory-scrubbing "
+                        f"memset in '{fn_name}'."
+                    )
+                if base_len > 8:
+                    return False, (
+                        f"Rejected (CWE-14): Pass eliminated {base_len}B memory-scrubbing "
+                        f"memset on '{base_dest}' in '{fn_name}'."
+                    )
+
+                # Conservatively require one newly-added zero store of the exact
+                # same width, to the same canonical pointer expression. Summed
+                # stores can overlap and therefore do not prove byte coverage.
+                key = (base_dest, base_len)
+                base_count = base_zero.get(base_dest, []).count(base_len)
+                candidate_count = candidate_zero.get(base_dest, []).count(base_len)
+                already_used = used_added_stores.get(key, 0)
+                if candidate_count - base_count - already_used < 1:
+                    return False, (
+                        f"Rejected (CWE-14): Pass eliminated {base_len}B memset on '{base_dest}' "
+                        f"in '{fn_name}' without one exact-width zero store to the same pointer."
+                    )
+                used_added_stores[key] = already_used + 1
 
         return True, "Security invariants (CWE-14 memory scrubbing) preserved."
 

@@ -461,6 +461,142 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
             self.assertIn("CWE-14", msg_unrel)
             ok_same, _ = CandidateValidator.check_security_invariants(str(base_8b), str(cand_same_8b))
             self.assertTrue(ok_same)
+            cand_overlapping = Path(tmp) / "cand_overlapping.ll"
+            cand_overlapping.write_text(
+                "define void @scrub8(ptr %secret) {\n"
+                "entry:\n"
+                "  store i32 0, ptr %secret, align 4\n"
+                "  store i32 0, ptr %secret, align 4\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_overlapping, msg_overlapping = CandidateValidator.check_security_invariants(
+                str(base_8b), str(cand_overlapping)
+            )
+            self.assertFalse(ok_overlapping)
+            self.assertIn("CWE-14", msg_overlapping)
+
+            # A replacement memset to another destination must fail even when
+            # the total number of memset calls remains unchanged.
+            cand_retargeted = Path(tmp) / "cand_retargeted.ll"
+            cand_retargeted.write_text(
+                "define void @scrub8(ptr %secret, ptr %other) {\n"
+                "entry:\n"
+                "  call void @llvm.memset.p0.i64(ptr %other, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            base_retarget = Path(tmp) / "base_retarget.ll"
+            base_retarget.write_text(
+                "define void @scrub8(ptr %secret, ptr %other) {\n"
+                "entry:\n"
+                "  call void @llvm.memset.p0.i64(ptr %secret, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_retargeted, msg_retargeted = CandidateValidator.check_security_invariants(
+                str(base_retarget), str(cand_retargeted)
+            )
+            self.assertFalse(ok_retargeted)
+            self.assertIn("CWE-14", msg_retargeted)
+
+            # GEP offsets are part of the destination identity: a store at a
+            # different offset from the scrubbed range must not satisfy it.
+            base_gep = Path(tmp) / "base_gep.ll"
+            cand_gep_wrong_offset = Path(tmp) / "cand_gep_wrong_offset.ll"
+            cand_gep_same_offset = Path(tmp) / "cand_gep_same_offset.ll"
+            base_gep.write_text(
+                "define void @scrub_gep(ptr %secret) {\n"
+                "entry:\n"
+                "  %p = getelementptr i8, ptr %secret, i64 0\n"
+                "  call void @llvm.memset.p0.i64(ptr %p, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_gep_wrong_offset.write_text(
+                "define void @scrub_gep(ptr %secret) {\n"
+                "entry:\n"
+                "  %p = getelementptr i8, ptr %secret, i64 1\n"
+                "  store i64 0, ptr %p, align 8\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_gep_same_offset.write_text(
+                "define void @scrub_gep(ptr %secret) {\n"
+                "entry:\n"
+                "  %p = getelementptr i8, ptr %secret, i64 0\n"
+                "  store i64 0, ptr %p, align 8\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_gep_wrong, msg_gep_wrong = CandidateValidator.check_security_invariants(
+                str(base_gep), str(cand_gep_wrong_offset)
+            )
+            self.assertFalse(ok_gep_wrong)
+            self.assertIn("CWE-14", msg_gep_wrong)
+            ok_gep_same, _ = CandidateValidator.check_security_invariants(
+                str(base_gep), str(cand_gep_same_offset)
+            )
+            self.assertTrue(ok_gep_same)
+
+            # Identically-shaped allocas remain distinct destinations.
+            base_local = Path(tmp) / "base_local.ll"
+            cand_other_local = Path(tmp) / "cand_other_local.ll"
+            base_local.write_text(
+                "define void @scrub_local() {\n"
+                "entry:\n"
+                "  %secret = alloca i64, align 8\n"
+                "  call void @llvm.memset.p0.i64(ptr %secret, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_other_local.write_text(
+                "define void @scrub_local() {\n"
+                "entry:\n"
+                "  %secret = alloca i64, align 8\n"
+                "  %other = alloca i64, align 8\n"
+                "  store i64 0, ptr %other, align 8\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_other_local, msg_other_local = CandidateValidator.check_security_invariants(
+                str(base_local), str(cand_other_local)
+            )
+            self.assertFalse(ok_other_local)
+            self.assertIn("CWE-14", msg_other_local)
+
+            # A volatile wipe cannot be replaced by a non-volatile store/call.
+            base_volatile = Path(tmp) / "base_volatile.ll"
+            cand_nonvolatile = Path(tmp) / "cand_nonvolatile.ll"
+            base_volatile.write_text(
+                "define void @scrub_volatile(ptr %secret) {\n"
+                "entry:\n"
+                "  call void @llvm.memset.p0.i64(ptr %secret, i8 0, i64 8, i1 true)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_nonvolatile.write_text(
+                "define void @scrub_volatile(ptr %secret) {\n"
+                "entry:\n"
+                "  call void @llvm.memset.p0.i64(ptr %secret, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_nonvolatile, msg_nonvolatile = CandidateValidator.check_security_invariants(
+                str(base_volatile), str(cand_nonvolatile)
+            )
+            self.assertFalse(ok_nonvolatile)
+            self.assertIn("CWE-14", msg_nonvolatile)
 
             # pre_fix resolves headers located in passed include_dirs
             from agents.fixer_agent import FixerAgent
