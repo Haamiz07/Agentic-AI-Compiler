@@ -4,11 +4,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
 from .models import ValidationResult
+from core.toolchain import macos_sdk_args
 
 L1I_CACHE_BYTES = 32768  # 32 KB typical per-core L1 instruction cache capacity
 
@@ -394,8 +396,8 @@ class CandidateValidator:
             cxx_candidate = compiler.replace("clang.exe", "clang++.exe") if compiler.endswith(".exe") else compiler + "++"
             if os.path.exists(cxx_candidate) or shutil.which(cxx_candidate):
                 compiler = cxx_candidate
-        cmd = [compiler, "-Wno-everything", ir_path, "-o", str(output_path)]
-        if os.name != "nt":
+        cmd = [compiler, *macos_sdk_args(), "-Wno-everything", ir_path, "-o", str(output_path)]
+        if os.name != "nt" and sys.platform != "darwin":
             cmd.append("-lm")
         env = self._build_env()
         try:

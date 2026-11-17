@@ -49,7 +49,7 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
                 '    return a * 2 + b;\n'
                 '}\n'
                 'int main() {\n'
-                '    printf("%d\\n", compute(3, 4));\n'
+                '    std::printf("%d\\n", compute(3, 4));\n'
                 '    return 0;\n'
                 '}\n',
                 encoding="utf-8",
@@ -192,7 +192,7 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
                 'int main() {\n'
                 '    int acc = 0;\n'
                 '    for (int i = 0; i < 50; ++i) acc += i * 2;\n'
-                '    printf("%d\\n", acc);\n'
+                '    std::printf("%d\\n", acc);\n'
                 '    return 0;\n'
                 '}\n',
                 encoding="utf-8",

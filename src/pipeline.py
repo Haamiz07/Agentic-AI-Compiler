@@ -82,7 +82,9 @@ except ImportError:
 
 from safety import (SecurityAnalyzer, SafeOptimizationController,
                     OptimizationAttemptRecord, PolicyDecision)
+from safety.provenance import write_provenance_manifest, verify_provenance_manifest
 from safety.validator import _locate_tool, _DEFAULT_TOOLCHAIN_DIRS
+from core.toolchain import macos_sdk_args
 
 try:
     from web_ui.app import WebUIServer, pipeline_result_to_dict
@@ -132,6 +134,7 @@ class PipelineResult:
     security_findings: list            = field(default_factory=list)
     optimization_attempts: list        = field(default_factory=list)
     empirical_benchmark: dict          = field(default_factory=dict)
+    provenance_path: str               = ""
 
 
 @dataclass
@@ -171,6 +174,9 @@ class Pipeline:
         self.verbose      = verbose
         self.interactive  = interactive   # ← NEW: lightweight interactive prompts
         self.config       = self._load_config(config_path)
+        self._last_ir_origin = "unknown"
+        self._last_frontend_compiler = ""
+        self._last_codegen_compiler = ""
         self.policy_gate_enabled = self.config.get("policy_gate", {}).get("enabled", True)
         self.security_analyzer = SecurityAnalyzer()
         self.safe_optimizer = SafeOptimizationController(self.config)
@@ -402,15 +408,18 @@ class Pipeline:
         else:
             self._log("[6.5/6] Policy gate disabled by configuration; using original IR.")
 
-        # ── Stage 7: Emit binary (always attempted, graceful fallback) ─
+        # ── Stage 7: Emit binary when requested ───────────────────────
         binary_path = ""
         t = time.perf_counter()
-        binary_path = self._emit_binary(selected_ir_path, source_path)
+        if emit_binary:
+            binary_path = self._emit_binary(selected_ir_path, source_path)
         stage_times["codegen"] = time.perf_counter() - t
         if binary_path:
             self._log(f"[6/6] Binary: {binary_path}")
+        elif emit_binary:
+            self._log("[6/6] Binary: skipped (clang not available or codegen failed)")
         else:
-            self._log("[6/6] Binary: skipped (clang not available or IR-only mode)")
+            self._log("[6/6] Binary: not requested (IR-only mode)")
 
         # ── Stage 8: Experience store ──────────────────────────────────
         t = time.perf_counter()
@@ -459,8 +468,59 @@ class Pipeline:
                              f"{len(optimization_attempts)} proposed action(s).")
         result.notes += " Tuner latency figures are estimates, not independent benchmark measurements."
 
+        # Record artifact fingerprints and the decisions that produced them.
+        try:
+            manifest_path = str(selected_ir_path) + ".provenance.json"
+            result.provenance_path = str(write_provenance_manifest(
+                manifest_path,
+                source_path=source_path,
+                ir_path=selected_ir_path,
+                binary_path=binary_path,
+                ir_origin=self._last_ir_origin,
+                compiler=self._provenance_compiler_info(),
+                pipeline_success=result.success,
+                security_findings=security_findings,
+                optimization_attempts=optimization_attempts,
+            ))
+            self._log(f"[Provenance] Build receipt: {result.provenance_path}")
+        except Exception as exc:
+            result.notes += f" Provenance report could not be written: {type(exc).__name__}: {exc}."
+            self._log(f"[Provenance] Could not write build receipt: {exc}")
+
         self._print_summary(result)
         return result
+
+    @staticmethod
+    def _tool_version(tool_path: str) -> str:
+        if not tool_path:
+            return "unavailable"
+        try:
+            completed = subprocess.run(
+                [tool_path, "--version"], capture_output=True, text=True,
+                timeout=5, check=False,
+            )
+            output = (completed.stdout or completed.stderr or "").strip()
+            return output.splitlines()[0][:300] if output else "version unavailable"
+        except (OSError, subprocess.TimeoutExpired):
+            return "version unavailable"
+
+    def _provenance_compiler_info(self) -> dict:
+        opt_path = getattr(getattr(self.safe_optimizer, "runner", None), "opt_path", "")
+        tools = {}
+        for name, path in (
+            ("clang_frontend", self._last_frontend_compiler),
+            ("clang_codegen", self._last_codegen_compiler),
+            ("llvm_opt", opt_path),
+        ):
+            tools[name] = {
+                "path": path or "unavailable",
+                "version": self._tool_version(path),
+            }
+        return {
+            "tools": tools,
+            "target_arch": self.config.get("compiler", {}).get("target_arch", ""),
+            "configured_opt_level": self.config.get("compiler", {}).get("opt_level", ""),
+        }
 
     # ------------------------------------------------------------------
     # Agent chain execution
@@ -783,7 +843,7 @@ class Pipeline:
             arch   = self.config.get("compiler", {}).get("target_arch", "")
             target = [f"--target={arch}"] if arch else []
             cmd = [
-                clang_bin, "-S", "-emit-llvm", "-O0",
+                clang_bin, *macos_sdk_args(), "-S", "-emit-llvm", "-O0",
                 "-Xclang", "-disable-O0-optnone",
                 "-gline-tables-only", "-Wno-everything",
             ] + target + [source_path, "-o", ir_path]
@@ -793,6 +853,8 @@ class Pipeline:
                     env=self._toolchain_env(clang_bin),
                 )
                 if result.returncode == 0 and os.path.exists(ir_path):
+                    self._last_ir_origin = "clang"
+                    self._last_frontend_compiler = clang_bin
                     return ir_path
                 self._log(f"  Clang error: {result.stderr[:160]}")
             except Exception as e:
@@ -810,6 +872,8 @@ class Pipeline:
             stub = _STUB_IR_TEMPLATE
         with open(ir_path, "w") as f:
             f.write(stub)
+        self._last_ir_origin = "stub"
+        self._last_frontend_compiler = clang_bin or ""
         self._log(f"  (Stub IR — clang not available or source not found)")
         return ir_path
 
@@ -818,14 +882,15 @@ class Pipeline:
         Final codegen: clang++ takes optimised IR → native binary.
         """
         clang_bin = _locate_tool("", ("clang++", "clang"))
+        self._last_codegen_compiler = clang_bin or ""
         if not clang_bin:
             self._log("  codegen skipped — clang not available")
             return ""
 
         ext = ".exe" if os.name == "nt" else ""
         base_out = ir_path.replace(".ll", "").replace("_opt", "").replace("_safe", "") + "_bin" + ext
-        cmd = [clang_bin, "-Wno-everything", ir_path, "-o", base_out]
-        if os.name != "nt":
+        cmd = [clang_bin, *macos_sdk_args(), "-Wno-everything", ir_path, "-o", base_out]
+        if os.name != "nt" and sys.platform != "darwin":
             cmd.append("-lm")
         try:
             result = subprocess.run(
@@ -1401,6 +1466,7 @@ Examples:
   python src/pipeline.py examples/hft_strategy.cpp --web   # + launch dashboard
   python src/pipeline.py --benchmark                        # -O3 vs AGentic_C
   python src/pipeline.py --demo                             # bundled demo
+  python src/pipeline.py --verify-provenance PATH            # check recorded artifact hashes
     """
     )
     parser.add_argument("source", nargs="?", default="",
@@ -1421,9 +1487,16 @@ Examples:
                         help="Pause at key decisions (retry prompts, memory store, explainer)")
     parser.add_argument("--json",        action="store_true",
                         help="Write JSON results to /tmp/agentic_c/results_latest.json")
+    parser.add_argument("--verify-provenance", metavar="MANIFEST",
+                        help="Verify artifact hashes recorded in a provenance manifest")
     parser.add_argument("--port",        type=int, default=5050,
                         help="Web UI port (default: 5050)")
     args = parser.parse_args()
+
+    if args.verify_provenance:
+        verification = verify_provenance_manifest(args.verify_provenance)
+        print(json.dumps(verification, indent=2))
+        sys.exit(0 if verification.get("valid_manifest") else 1)
 
     stub_mode = not args.no_stub
 
@@ -1509,6 +1582,7 @@ def _write_results_json(result, pipeline, web_server=None):
             explanation    = explanation,
             reward_breakdown= reward_bd,
         )
+        d["provenance_path"] = result.provenance_path
 
         os.makedirs(os.path.dirname(RESULTS_JSON_PATH), exist_ok=True)
         with open(RESULTS_JSON_PATH, "w") as f:

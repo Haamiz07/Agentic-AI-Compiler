@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import yaml
+from core.toolchain import macos_sdk_args
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +228,7 @@ class Frontend:
                     compiler = cxx
         cmd = [
             compiler,
+            *macos_sdk_args(),
             "-O0",
             "-Xclang",
             "-disable-O0-optnone",
