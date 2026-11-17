@@ -45,11 +45,14 @@ validation:
   timeout_s: 20
   require_behavior_checks: true   # keep true for acceptance based on evidence
   benchmark_runs: 5
-  # Representative behavior fixtures tested against baseline and candidate binaries.
+  # Representative + edge-case differential fixtures tested against baseline and candidate binaries.
   behavior_inputs:
     - ""
+    - "0 0 0\n"
     - "100\n"
     - "1000 250 5\n"
+    - "-1 -999 0\n"
+    - "2147483647 1 100\n"
 
 # ------------------------------------------------------------
 # Pipeline mode

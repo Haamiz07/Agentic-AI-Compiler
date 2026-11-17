@@ -44,6 +44,14 @@ class ValidationResult:
     candidate_ir: str = ""
     details: list[str] = field(default_factory=list)
     reason: str = ""
+    p99_baseline_ns: Optional[float] = None
+    p99_candidate_ns: Optional[float] = None
+    baseline_size_bytes: Optional[int] = None
+    candidate_size_bytes: Optional[int] = None
+    baseline_text_bytes: Optional[int] = None
+    candidate_text_bytes: Optional[int] = None
+    l1i_cache_budget_ok: Optional[bool] = None
+    security_invariants_preserved: Optional[bool] = None
 
     def to_dict(self) -> dict:
         return asdict(self)

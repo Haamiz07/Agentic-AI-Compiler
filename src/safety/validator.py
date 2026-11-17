@@ -1,11 +1,16 @@
-"""Compile, fixture-based behavior validation, and empirical microbenchmarking for candidate IR."""
+"""Compile, fixture-based behavior validation, CWE-14 security checks, and microbenchmarking for candidate IR."""
+import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import Optional
 from .models import ValidationResult
+
+L1I_CACHE_BYTES = 32768  # 32 KB typical per-core L1 instruction cache capacity
 
 _DEFAULT_TOOLCHAIN_DIRS = (
     r"C:\msys64\ucrt64\bin",
@@ -39,6 +44,7 @@ class CandidateValidator:
                  behavior_inputs=None, require_behavior_checks: bool = False,
                  benchmark_runs: int = 5):
         self.clang_path = _locate_tool(clang_path, ("clang++", "clang"))
+        self.size_path = _locate_tool("", ("llvm-size", "size"))
         self.timeout_s = timeout_s
         self.behavior_inputs = list(behavior_inputs if behavior_inputs is not None else [""])
         self.require_behavior_checks = bool(require_behavior_checks)
@@ -67,6 +73,91 @@ class CandidateValidator:
             self._baseline_cache[key] = target
         return ok, msg, target
 
+    @staticmethod
+    def _extract_ir_functions(ir_text: str) -> dict[str, str]:
+        """Extract per-function IR bodies keyed by symbol name."""
+        funcs: dict[str, str] = {}
+        current_name = ""
+        current_lines: list[str] = []
+        for line in ir_text.splitlines():
+            if not current_name:
+                m = re.match(r'^\s*define\b[^@]*@"?([^"\s(]+)"?\s*\(', line)
+                if m:
+                    current_name = m.group(1)
+                    current_lines = [line]
+            else:
+                current_lines.append(line)
+                if line.strip() == "}":
+                    funcs[current_name] = "\n".join(current_lines)
+                    current_name = ""
+                    current_lines = []
+        return funcs
+
+    @classmethod
+    def check_security_invariants(cls, baseline_ir: str, candidate_ir: str) -> tuple[bool, str]:
+        """Verify optimization passes preserved security-critical memory scrubs (CWE-14)."""
+        try:
+            base_text = Path(baseline_ir).read_text(encoding="utf-8", errors="replace")
+            cand_text = Path(candidate_ir).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return False, f"Could not inspect IR for security invariants: {exc}"
+
+        explicit_pat = re.compile(r"\bcall\b[^\n]*@(?:explicit_bzero|memset_s)\b")
+        base_explicit = len(explicit_pat.findall(base_text))
+        cand_explicit = len(explicit_pat.findall(cand_text))
+        if cand_explicit < base_explicit:
+            return False, (
+                f"Rejected (CWE-14): Pass eliminated {base_explicit - cand_explicit} "
+                f"explicit memory-scrubbing call(s)."
+            )
+
+        base_funcs = cls._extract_ir_functions(base_text)
+        cand_funcs = cls._extract_ir_functions(cand_text)
+        memset_pat = re.compile(r"\bcall\b[^\n]*@(?:llvm\.memset[^\s(]*|memset|explicit_bzero|memset_s)\b")
+        zero_store_pat = re.compile(
+            r"\bstore\s+(?:i\d+|ptr|float|double|<\d+\s*x\s*[^>]+>)\s+(?:0|0\.0+e\+00|null|zeroinitializer)\s*,"
+        )
+
+        for fn_name, base_body in base_funcs.items():
+            if fn_name.startswith(("_ZNSt", "_ZSt", "_ZNKSt")) or fn_name not in cand_funcs:
+                continue
+            cand_body = cand_funcs[fn_name]
+            base_clears = len(memset_pat.findall(base_body))
+            cand_clears = len(memset_pat.findall(cand_body))
+            if cand_clears < base_clears:
+                added_zeros = len(zero_store_pat.findall(cand_body)) - len(zero_store_pat.findall(base_body))
+                if added_zeros < (base_clears - cand_clears):
+                    return False, (
+                        f"Rejected (CWE-14): Pass eliminated {base_clears - cand_clears} "
+                        f"memory-scrubbing memset call(s) in '{fn_name}' without zero-store replacement."
+                    )
+
+        return True, "Security invariants (CWE-14 memory scrubbing) preserved."
+
+    def _measure_code_footprint(self, binary_path: Path) -> tuple[Optional[int], Optional[int]]:
+        """Measure linked executable file size and .text instruction section bytes."""
+        try:
+            file_bytes = binary_path.stat().st_size
+        except OSError:
+            return None, None
+        text_bytes = None
+        if self.size_path:
+            try:
+                res = subprocess.run(
+                    [self.size_path, str(binary_path)],
+                    capture_output=True, text=True, timeout=5,
+                    env=self._build_env(), check=False,
+                )
+                if res.returncode == 0:
+                    lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+                    if len(lines) >= 2:
+                        parts = lines[1].split()
+                        if parts and parts[0].isdigit():
+                            text_bytes = int(parts[0])
+            except Exception:
+                pass
+        return file_bytes, text_bytes
+
     def validate(self, baseline_ir: str, candidate_ir: str,
                  run_benchmark: bool = True) -> ValidationResult:
         details = []
@@ -84,10 +175,39 @@ class CandidateValidator:
                 return ValidationResult(False, False, baseline_ir=baseline_ir,
                     candidate_ir=candidate_ir, details=details,
                     reason="Baseline and candidate must both compile.")
+
+            inv_ok, inv_msg = self.check_security_invariants(baseline_ir, candidate_ir)
+            details.append(inv_msg)
+            if not inv_ok:
+                return ValidationResult(
+                    False, True,
+                    baseline_ir=baseline_ir,
+                    candidate_ir=candidate_ir,
+                    details=details,
+                    reason=inv_msg,
+                    security_invariants_preserved=False,
+                )
+
+            base_size, base_text = self._measure_code_footprint(baseline_bin)
+            cand_size, cand_text = self._measure_code_footprint(candidate_bin)
+            l1i_ok = (cand_text <= L1I_CACHE_BYTES) if cand_text is not None else None
+            if cand_text is not None:
+                details.append(
+                    f"code footprint: .text={cand_text}B"
+                    + (f" (baseline={base_text}B)" if base_text is not None else "")
+                    + f" vs {L1I_CACHE_BYTES}B L1i budget -> {'OK' if l1i_ok else 'OVER L1i'}"
+                )
+
             if not self.behavior_inputs:
                 return ValidationResult(not self.require_behavior_checks, True,
                     baseline_ir=baseline_ir,
                     candidate_ir=candidate_ir, details=details,
+                    baseline_size_bytes=base_size,
+                    candidate_size_bytes=cand_size,
+                    baseline_text_bytes=base_text,
+                    candidate_text_bytes=cand_text,
+                    l1i_cache_budget_ok=l1i_ok,
+                    security_invariants_preserved=True,
                     reason=("Compile validation passed; behavior was not checked because no trusted fixtures are configured."
                             if not self.require_behavior_checks else
                             "Behavior validation is required, but no trusted fixtures are configured."))
@@ -95,8 +215,9 @@ class CandidateValidator:
             details.extend(behavior_details)
             bench_checked = False
             base_ns, cand_ns, speedup = None, None, None
+            base_p99, cand_p99 = None, None
             if behavior_ok and run_benchmark and self.benchmark_runs > 0:
-                bench_checked, base_ns, cand_ns, speedup, bench_msg = self._benchmark_runs(
+                bench_checked, base_ns, cand_ns, speedup, base_p99, cand_p99, bench_msg = self._benchmark_runs(
                     baseline_bin, candidate_bin, tmp
                 )
                 if bench_msg:
@@ -112,7 +233,15 @@ class CandidateValidator:
                 baseline_ir=baseline_ir,
                 candidate_ir=candidate_ir,
                 details=details,
-                reason="Behavior fixtures matched." if behavior_ok else "Behavior fixture mismatch or execution failure.")
+                reason="Behavior fixtures matched." if behavior_ok else "Behavior fixture mismatch or execution failure.",
+                p99_baseline_ns=base_p99,
+                p99_candidate_ns=cand_p99,
+                baseline_size_bytes=base_size,
+                candidate_size_bytes=cand_size,
+                baseline_text_bytes=base_text,
+                candidate_text_bytes=cand_text,
+                l1i_cache_budget_ok=l1i_ok,
+                security_invariants_preserved=True)
 
     def _compile(self, ir_path: str, output_path: Path):
         compiler = self.clang_path
@@ -153,11 +282,11 @@ class CandidateValidator:
         return True, details
 
     def _benchmark_runs(self, baseline_bin: Path, candidate_bin: Path, tmp: str):
-        """Run empirical wall-clock microbenchmark across configured iterations."""
+        """Run empirical wall-clock microbenchmark across configured iterations (median + p99 tail)."""
         input_text = self.behavior_inputs[0] if self.behavior_inputs else ""
         # Warm-up run
         if self._run(baseline_bin, input_text, tmp) is None or self._run(candidate_bin, input_text, tmp) is None:
-            return False, None, None, None, "benchmark skipped: warmup failed"
+            return False, None, None, None, None, None, "benchmark skipped: warmup failed"
 
         base_times = []
         cand_times = []
@@ -168,19 +297,26 @@ class CandidateValidator:
             r_c = self._run(candidate_bin, input_text, tmp)
             t2 = time.perf_counter_ns()
             if r_b is None or r_c is None:
-                return False, None, None, None, "benchmark aborted: timed out"
+                return False, None, None, None, None, None, "benchmark aborted: timed out"
             base_times.append(float(t1 - t0))
             cand_times.append(float(t2 - t1))
 
         base_times.sort()
         cand_times.sort()
-        # Median wall-clock time in nanoseconds
+        # Median and nearest-rank p99 tail latency in nanoseconds
         mid = len(base_times) // 2
+        p99_idx = max(0, math.ceil(0.99 * len(base_times)) - 1)
         base_med = round(base_times[mid], 1)
         cand_med = round(cand_times[mid], 1)
+        base_p99 = round(base_times[p99_idx], 1)
+        cand_p99 = round(cand_times[p99_idx], 1)
         speedup = round((base_med - cand_med) / max(base_med, 1.0) * 100.0, 2)
-        msg = f"empirical median ({self.benchmark_runs} runs): baseline={base_med/1e6:.2f}ms, candidate={cand_med/1e6:.2f}ms ({speedup:+.1f}%)"
-        return True, base_med, cand_med, speedup, msg
+        msg = (
+            f"empirical ({self.benchmark_runs} runs): median baseline={base_med/1e6:.2f}ms, "
+            f"candidate={cand_med/1e6:.2f}ms ({speedup:+.1f}%) | "
+            f"p99 tail={cand_p99/1e6:.2f}ms"
+        )
+        return True, base_med, cand_med, speedup, base_p99, cand_p99, msg
 
     def _build_env(self) -> dict:
         env = dict(os.environ)

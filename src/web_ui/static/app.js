@@ -339,7 +339,7 @@ function renderSafetyReview(data) {
         : (item.executed ? 'Validation not completed' : 'Not executed');
       const reason = item.reason || policy.reason || 'No explanation recorded.';
       const checks = validation
-        ? `<div class="safety-meta">Compiled: ${validation.compile_success ? 'yes' : 'no'} · Behavior checked: ${validation.behavior_checked ? 'yes' : 'no'}${validation.behavior_checked ? ` · Same output: ${validation.behavior_preserved ? 'yes' : 'no'}` : ''}${validation.speedup_pct != null ? ` · Empirical Δ: ${validation.speedup_pct >= 0 ? '+' : ''}${Number(validation.speedup_pct).toFixed(1)}%` : ''}</div>`
+        ? `<div class="safety-meta">Compiled: ${validation.compile_success ? 'yes' : 'no'} · Security invariants (CWE-14): ${validation.security_invariants_preserved === false ? 'VIOLATED' : 'preserved'} · Behavior checked: ${validation.behavior_checked ? 'yes' : 'no'}${validation.behavior_checked ? ` · Same output: ${validation.behavior_preserved ? 'yes' : 'no'}` : ''}${validation.speedup_pct != null ? ` · Empirical Δ: ${validation.speedup_pct >= 0 ? '+' : ''}${Number(validation.speedup_pct).toFixed(1)}%` : ''}${validation.p99_candidate_ns != null ? ` · p99: ${(Number(validation.p99_candidate_ns) / 1e6).toFixed(2)}ms` : ''}${validation.candidate_text_bytes != null ? ` · .text: ${(Number(validation.candidate_text_bytes) / 1024).toFixed(1)}KB (${validation.l1i_cache_budget_ok ? '≤32KB L1i' : '>32KB L1i'})` : ''}</div>`
         : '';
       const stageTag = item.stage ? `<span class="safety-badge">${esc(item.stage)}</span>` : '';
       const feedbackHtml = item.feedback ? `<div class="safety-meta" style="color:var(--accent)">Critic feedback: ${esc(item.feedback)}</div>` : '';
@@ -533,11 +533,38 @@ function scoreFromImprovement(pct) {
   return 40;
 }
 
+let pendingRepairedSource = null;
+
+function applySuggestedFixToEditor(andCompile = false) {
+  const editorEl = document.getElementById('sourceEditor');
+  const synEl    = document.getElementById('syntaxErrorPanel');
+  const msgEl    = document.getElementById('compileStatusMsg');
+  if (!editorEl || !pendingRepairedSource) return;
+
+  editorEl.value = pendingRepairedSource;
+  pendingRepairedSource = null;
+  if (synEl) {
+    synEl.style.display = 'none';
+    synEl.innerHTML = '';
+  }
+  if (andCompile) {
+    compileFromEditor();
+  } else if (msgEl) {
+    msgEl.style.display = 'block';
+    msgEl.innerHTML = `<span style="color:var(--green);font-weight:600">✓ Fixer Agent applied suggested syntax repair to the editor.</span> Review the code above or click <b>⚡ Compile &amp; Optimize</b>.`;
+  }
+}
+
 /* ── Interactive Source Editor & Live Compiler ──────────────────────── */
 async function loadSourceIntoEditor(requestedFile) {
   const selectEl = document.getElementById('sourceSelect');
   const editorEl = document.getElementById('sourceEditor');
+  const synEl    = document.getElementById('syntaxErrorPanel');
+  const msgEl    = document.getElementById('compileStatusMsg');
   if (!selectEl || !editorEl) return;
+  if (synEl) { synEl.style.display = 'none'; synEl.innerHTML = ''; }
+  if (msgEl) { msgEl.style.display = 'none'; }
+  pendingRepairedSource = null;
   const target = requestedFile || selectEl.value || '';
   try {
     const url = '/api/source' + (target ? `?file=${encodeURIComponent(target)}` : '');
@@ -564,10 +591,17 @@ async function compileFromEditor() {
   const editorEl = document.getElementById('sourceEditor');
   const btnEl    = document.getElementById('btnCompileSource');
   const msgEl    = document.getElementById('compileStatusMsg');
+  const synEl    = document.getElementById('syntaxErrorPanel');
   if (!editorEl) return;
 
   const filename = (selectEl && selectEl.value) ? selectEl.value : 'examples/market_maker.cpp';
   const sourceCode = editorEl.value;
+
+  if (synEl) {
+    synEl.style.display = 'none';
+    synEl.innerHTML = '';
+  }
+  pendingRepairedSource = null;
 
   if (btnEl) {
     btnEl.disabled = true;
@@ -596,13 +630,62 @@ async function compileFromEditor() {
       const acc = (data.results.optimization_attempts || []).filter(a => a && a.accepted).length;
       const tot = (data.results.optimization_attempts || []).length;
       const emp = data.results.empirical_benchmark || {};
-      const empInfo = emp.speedup_pct != null ? ` · Empirical binary Δ: ${emp.speedup_pct >= 0 ? '+' : ''}${Number(emp.speedup_pct).toFixed(1)}%` : '';
+      const empParts = [];
+      if (emp.speedup_pct != null) {
+        empParts.push(`Empirical Δ: ${emp.speedup_pct >= 0 ? '+' : ''}${Number(emp.speedup_pct).toFixed(1)}%`);
+      }
+      if (emp.p99_candidate_ns != null) {
+        empParts.push(`p99 tail: ${(Number(emp.p99_candidate_ns) / 1e6).toFixed(2)}ms`);
+      }
+      if (emp.candidate_text_bytes != null) {
+        empParts.push(`.text: ${(Number(emp.candidate_text_bytes) / 1024).toFixed(1)}KB (${emp.l1i_cache_budget_ok ? 'within 32KB L1i cache' : 'over 32KB L1i'})`);
+      }
+      const empInfo = empParts.length ? ` · ${empParts.join(' · ')}` : '';
       if (msgEl) {
         msgEl.innerHTML = `<span style="color:var(--green);font-weight:600">✓ Compilation complete</span> — ${acc}/${tot} LLVM passes verified &amp; accepted${esc(empInfo)}.`;
       }
+    } else if (data && data.syntax_error) {
+      setStatus('error', 'C++ Syntax Error detected');
+      if (msgEl) {
+        msgEl.innerHTML = `<span style="color:var(--red);font-weight:700">✗ Compilation halted — C++ Syntax Error detected by Clang &amp; Fixer Agent.</span>`;
+      }
+      if (synEl) {
+        const diags = Array.isArray(data.diagnostics) ? data.diagnostics : [];
+        pendingRepairedSource = (data.can_auto_fix && typeof data.repaired_source === 'string') ? data.repaired_source : null;
+
+        const diagCards = diags.length ? diags.map(d => `
+          <div style="padding:10px 12px;background:#FFFFFF;border:1px solid rgba(220,38,38,0.25);border-left:4px solid var(--red);border-radius:var(--r);margin-bottom:8px;">
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+              <span style="padding:2px 8px;border-radius:12px;background:rgba(220,38,38,0.1);color:var(--red);font-family:var(--mono);font-size:11px;font-weight:700;">Line ${esc(d.line)} : Col ${esc(d.column)}</span>
+              <span style="font-size:12px;font-weight:700;color:var(--text);">error: ${esc(d.message)}</span>
+            </div>
+            ${d.snippet ? `<pre style="margin:6px 0;padding:6px 10px;background:var(--bg-soft);border-radius:6px;font-family:var(--mono);font-size:11px;color:var(--text2);overflow-x:auto;">${esc(d.snippet)}</pre>` : ''}
+            <div style="font-size:12px;color:var(--green);font-weight:600;margin-top:4px;">💡 Fixer Agent Suggestion: ${esc(d.suggestion)}</div>
+          </div>
+        `).join('') : `<pre style="padding:10px;background:#fff;border-radius:6px;font-family:var(--mono);font-size:11px;color:var(--red);white-space:pre-wrap;">${esc(data.raw_diagnostics || data.error)}</pre>`;
+
+        const actionButtons = pendingRepairedSource ? `
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:10px;">
+            <button type="button" class="btn-refresh" style="background:var(--green);" onclick="applySuggestedFixToEditor(true)">🔧 Auto-Fix &amp; Compile</button>
+            <button type="button" class="btn-refresh" style="background:#FFFFFF;color:var(--text);border:1px solid var(--card-border);box-shadow:none;" onclick="applySuggestedFixToEditor(false)">✏️ Apply Fix to Editor Only</button>
+            <span style="font-size:11px;color:var(--text3);">Or edit the code manually in the editor above and click <b>⚡ Compile &amp; Optimize</b>.</span>
+          </div>
+        ` : `<div style="font-size:11px;color:var(--text3);margin-top:8px;">Edit the source code above to resolve the syntax error and click <b>⚡ Compile &amp; Optimize</b>.</div>`;
+
+        synEl.innerHTML = `
+          <div style="padding:14px 16px;background:#FFF5F5;border:1px solid rgba(220,38,38,0.3);border-radius:var(--r-lg);">
+            <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--red);margin-bottom:10px;">
+              🔍 Fixer Agent — Pre-IR Syntax Diagnostic &amp; Suggested Correction (${diags.length || 1} issue${diags.length === 1 ? '' : 's'})
+            </div>
+            ${diagCards}
+            ${actionButtons}
+          </div>
+        `;
+        synEl.style.display = 'block';
+      }
     } else {
       if (msgEl) {
-        msgEl.innerHTML = `<span style="color:var(--red)">✗ Compilation failed</span>`;
+        msgEl.innerHTML = `<span style="color:var(--red)">✗ Compilation failed: ${esc((data && data.error) || 'Unknown error')}</span>`;
       }
     }
   } catch (err) {

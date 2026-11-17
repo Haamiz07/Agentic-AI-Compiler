@@ -3,7 +3,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from .analysis import SecurityAnalyzer
-from .models import OptimizationAttemptRecord, PolicyDecision
+from .models import OptimizationAttemptRecord, PolicyDecision, ValidationResult
 from .policy import PassPolicy
 from .runner import LLVMOptRunner
 from .validator import CandidateValidator
@@ -110,13 +110,28 @@ class SafeOptimizationController:
                 )
                 return current_ir, rec, alts
 
+            inv_ok, inv_msg = self.validator.check_security_invariants(str(baseline_ir), str(candidate))
+            if not inv_ok:
+                alts = self._suggest_alternatives(action, key, seen, summary)
+                fb = f"{inv_msg} Suggesting fallback: {alts or 'none'}."
+                inv_val = ValidationResult(
+                    False, True, baseline_ir=str(baseline_ir), candidate_ir=str(candidate),
+                    details=[inv_msg], reason=inv_msg, security_invariants_preserved=False,
+                )
+                rec = OptimizationAttemptRecord(
+                    str(action), decision, executed=True, validation=inv_val,
+                    reason=f"Candidate rejected: {inv_msg}",
+                    stage=stage, feedback=fb
+                )
+                return current_ir, rec, alts
+
             if not run_validator:
                 accepted_path = base_path.with_name(f"{base_path.stem}_safe_opt.ll")
                 shutil.copy2(candidate, accepted_path)
-                fb = f"Accepted '{key}': LLVM opt applied and IR verified."
+                fb = f"Accepted '{key}': LLVM opt applied, IR verified, and security invariants preserved."
                 rec = OptimizationAttemptRecord(
                     str(action), decision, executed=True, accepted=True,
-                    reason=f"{run.reason} {finding_context}",
+                    reason=f"{run.reason} {inv_msg} {finding_context}",
                     stage=stage, feedback=fb
                 )
                 return str(accepted_path), rec, []

@@ -23,6 +23,12 @@ _PROMPT_INJECTION_RULES = (
     ("ADV-DISABLE-CHECKS", "critical", re.compile(r"\b(?:disable|skip|turn\s+off)\b.{0,45}\b(?:validation|verifier|safety\s+checks?)\b", re.I), "Adversarial directive attempting to disable compiler verification or safety checks."),
     ("ADV-MARK-SAFE", "critical", re.compile(r"\bmark\b.{0,35}\b(?:vulnerable|unsafe|malicious)\b.{0,25}\bsafe\b", re.I), "Adversarial directive attempting to spoof security classification."),
 )
+_TROJAN_BIDI_CHARS = frozenset({
+    "\u202a", "\u202b", "\u202c", "\u202d", "\u202e",  # Bidi LRE, RLE, PDF, LRO, RLO
+    "\u2066", "\u2067", "\u2068", "\u2069",            # Bidi LRI, RLI, FSI, PDI
+    "\u200e", "\u200f",                                # LRM, RLM
+})
+_TROJAN_ZERO_WIDTH_CHARS = frozenset({"\u200b", "\u200c", "\u200d", "\ufeff"})
 _FUNCTION = re.compile(r"^\s*(?:[\w:<>,*&~]+\s+)+(?P<name>[A-Za-z_]\w*)\s*\([^;]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{")
 _CONTROL = {"if", "for", "while", "switch", "catch"}
 _DBG_REF = re.compile(r"!dbg\s+!(?P<id>\d+)")
@@ -90,6 +96,19 @@ class SecurityAnalyzer:
             file_label = "<input>"
         out = []
         for number, raw in enumerate(text.splitlines(), 1):
+            for idx, ch in enumerate(raw):
+                if ch in _TROJAN_BIDI_CHARS or (ch in _TROJAN_ZERO_WIDTH_CHARS and not (number == 1 and idx == 0)):
+                    out.append(SecurityFinding(
+                        rule_id="ADV-TROJAN-SOURCE",
+                        severity="critical",
+                        message=f"Trojan Source invisible/bidirectional Unicode character U+{ord(ch):04X} detected (CVE-2021-42574).",
+                        file_path=file_label,
+                        line=number,
+                        function="<trojan-unicode>",
+                        source_kind="prompt_guard",
+                        snippet=repr(raw.strip()[:120]),
+                    ))
+                    break
             for rule, severity, pattern, message in _PROMPT_INJECTION_RULES:
                 if pattern.search(raw):
                     out.append(SecurityFinding(

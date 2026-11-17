@@ -385,6 +385,13 @@ class Pipeline:
                         "baseline_latency_ns": val.baseline_latency_ns,
                         "candidate_latency_ns": val.candidate_latency_ns,
                         "speedup_pct": val.speedup_pct,
+                        "p99_baseline_ns": getattr(val, "p99_baseline_ns", None),
+                        "p99_candidate_ns": getattr(val, "p99_candidate_ns", None),
+                        "baseline_size_bytes": getattr(val, "baseline_size_bytes", None),
+                        "candidate_size_bytes": getattr(val, "candidate_size_bytes", None),
+                        "baseline_text_bytes": getattr(val, "baseline_text_bytes", None),
+                        "candidate_text_bytes": getattr(val, "candidate_text_bytes", None),
+                        "l1i_cache_budget_ok": getattr(val, "l1i_cache_budget_ok", None),
                     }
                     break
             self._log(f"[6.5/6] Policy gate: {len(accepted)} accepted, "

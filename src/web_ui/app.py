@@ -223,7 +223,30 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
                 return
             compile_target = str(valid_path)
 
+        from agents.fixer_agent import FixerAgent
         from pipeline import Pipeline, _HOTNESS_CACHE
+
+        auto_fix = bool(payload.get("auto_fix", False))
+        fixer = FixerAgent()
+        pre_check = fixer.pre_fix(compile_target)
+        repaired_applied = None
+
+        if not pre_check.get("valid", True):
+            if auto_fix and pre_check.get("can_auto_fix") and pre_check.get("repaired_source"):
+                repaired_applied = pre_check["repaired_source"]
+                Path(compile_target).write_text(repaired_applied, encoding="utf-8")
+            else:
+                self._send_json({
+                    "ok": False,
+                    "syntax_error": True,
+                    "error": "C++ syntax error detected by Clang & Fixer Agent.",
+                    "diagnostics": pre_check.get("errors", []),
+                    "raw_diagnostics": pre_check.get("raw_diagnostics", ""),
+                    "can_auto_fix": bool(pre_check.get("can_auto_fix", False)),
+                    "repaired_source": pre_check.get("repaired_source"),
+                }, status=200)
+                return
+
         pipe = Pipeline(config_path=str(root_dir / "configs" / "config.yaml"), stub_mode=True)
         res = pipe.compile(compile_target, emit_binary=emit_binary)
 
@@ -233,7 +256,11 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
         os.makedirs(os.path.dirname(self.results_path), exist_ok=True)
         with open(self.results_path, "w", encoding="utf-8") as f:
             json.dump(d, f, indent=2)
-        self._send_json({"ok": True, "results": d})
+        resp_payload = {"ok": True, "results": d}
+        if repaired_applied is not None:
+            resp_payload["repaired_source"] = repaired_applied
+            resp_payload["auto_fixed"] = True
+        self._send_json(resp_payload)
 
     def _send_json(self, payload, status=200):
         data = json.dumps(payload).encode("utf-8")

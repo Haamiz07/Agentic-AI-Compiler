@@ -323,6 +323,79 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
             finally:
                 server.stop()
 
+    def test_09_web_ui_syntax_error_and_autofix(self):
+        """Web UI detects missing semicolon via FixerAgent.pre_fix and offers optional automated repair."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            res_path = str(Path(tmp) / "results.json")
+            Path(res_path).write_text(json.dumps({"success": True}), encoding="utf-8")
+            server = WebUIServer(results_path=res_path, port=15061)
+            started = server.start()
+            self.assertTrue(started)
+            try:
+                broken_code = "int main() {\n  int x = 42\n  return x;\n}\n"
+                req = urllib.request.Request(
+                    "http://127.0.0.1:15061/api/compile",
+                    data=json.dumps({
+                        "filename": "broken_test.cpp",
+                        "source_code": broken_code,
+                        "emit_binary": False,
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    body = json.loads(r.read().decode("utf-8"))
+                    self.assertFalse(body["ok"])
+                    self.assertTrue(body.get("syntax_error"))
+                    self.assertTrue(body.get("can_auto_fix"))
+                    self.assertIn("int x = 42;", body.get("repaired_source", ""))
+                    self.assertGreaterEqual(len(body.get("diagnostics", [])), 1)
+            finally:
+                server.stop()
+
+    def test_10_trojan_source_unicode_detection_and_block(self):
+        """Entrance guard detects CVE-2021-42574 bidirectional Unicode overrides and blocks fail-closed."""
+        trojan_src = (
+            "// Security check: \u202e normal comment override\n"
+            "int main() { return 0; }\n"
+        )
+        findings = SecurityAnalyzer.scan_adversarial_directives(trojan_src, is_text=True)
+        self.assertTrue(any(f.rule_id == "ADV-TROJAN-SOURCE" for f in findings))
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            src = Path(tmp) / "trojan.cpp"
+            src.write_text(trojan_src, encoding="utf-8")
+            pipeline = Pipeline(config_path=str(ROOT / "configs" / "config.yaml"), stub_mode=True)
+            res = pipeline.compile(str(src), emit_binary=False)
+            self.assertGreaterEqual(len(res.optimization_attempts), 1)
+            self.assertEqual(res.optimization_attempts[0].action, "<entrance-prompt-guard>")
+            self.assertFalse(res.optimization_attempts[0].accepted)
+
+    def test_11_cwe14_security_invariant_and_domain_examples(self):
+        """CWE-14 guard blocks memset removal without zero-store replacement; Crypto and Aerospace examples compile with p99 & L1i footprint metrics."""
+        # 1. Compile Cryptography vault example: verify CWE-14 catches pass eliminating memset and critic falls back
+        pipe = Pipeline(config_path=str(ROOT / "configs" / "config.yaml"), stub_mode=True)
+        crypto_res = pipe.compile(str(ROOT / "examples" / "crypto_constant_time_vault.cpp"), emit_binary=True)
+        self.assertTrue(os.path.isfile(crypto_res.binary_path))
+        self.assertTrue(crypto_res.optimization_attempts)
+        cwe14_rejects = [
+            a for a in crypto_res.optimization_attempts
+            if (not a.accepted) and ("CWE-14" in a.reason)
+        ]
+        self.assertGreaterEqual(len(cwe14_rejects), 1, "Expected at least one pass rejected for CWE-14 memset removal")
+        accepted = [a for a in crypto_res.optimization_attempts if a.accepted]
+        self.assertGreaterEqual(len(accepted), 1, "Expected safe fallback passes to be accepted")
+
+        # 2. Compile Autonomous Flight Controller example & check p99 + L1i footprint telemetry
+        flight_res = pipe.compile(str(ROOT / "examples" / "autonomous_flight_controller.cpp"), emit_binary=True)
+        self.assertTrue(flight_res.success)
+        self.assertTrue(os.path.isfile(flight_res.binary_path))
+        eb = flight_res.empirical_benchmark or {}
+        self.assertIn("p99_candidate_ns", eb)
+        self.assertIsNotNone(eb["p99_candidate_ns"])
+        self.assertIn("candidate_text_bytes", eb)
+        if eb["candidate_text_bytes"] is not None:
+            self.assertIn(eb.get("l1i_cache_budget_ok"), (True, False))
+
 
 if __name__ == "__main__":
     unittest.main()
