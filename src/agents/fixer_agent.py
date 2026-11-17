@@ -627,9 +627,11 @@ class FixerAgent:
 
         try:
             from safety.validator import _locate_tool, _DEFAULT_TOOLCHAIN_DIRS
+            from core.toolchain import macos_sdk_args
         except ImportError:
             try:
                 from src.safety.validator import _locate_tool, _DEFAULT_TOOLCHAIN_DIRS
+                from src.core.toolchain import macos_sdk_args
             except ImportError:
                 return {"valid": True, "errors": [], "repaired_source": None, "can_auto_fix": False}
 
@@ -680,6 +682,7 @@ class FixerAgent:
 
         cmd = [
             clang_bin,
+            *macos_sdk_args(),
             "-fsyntax-only",
             "-fdiagnostics-parseable-fixits",
             "-Wno-everything",
