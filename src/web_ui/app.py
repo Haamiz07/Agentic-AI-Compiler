@@ -228,7 +228,11 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
 
         auto_fix = bool(payload.get("auto_fix", False))
         fixer = FixerAgent()
-        pre_check = fixer.pre_fix(compile_target)
+        pre_check = fixer.pre_fix(
+            compile_target,
+            config_path=str(root_dir / "configs" / "config.yaml"),
+            include_dirs=[str(root_dir), str(root_dir / "examples")],
+        )
         repaired_applied = None
 
         if not pre_check.get("valid", True):

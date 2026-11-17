@@ -610,10 +610,14 @@ class FixerAgent:
         """Delegate to HFTFixer."""
         return self.hft_fixer.hft_fix(source_snippet, unit_name, path_label)
 
-    def pre_fix(self, source_path: str) -> dict:
+    def pre_fix(self, source_path: str,
+                config_path: Optional[str] = None,
+                include_dirs: Optional[list[str]] = None,
+                extra_flags: Optional[list[str]] = None) -> dict:
         """
         Pre-IR Syntax Check & Automated Repair (Fixer Agent).
-        Runs clang++ -fsyntax-only -fdiagnostics-parseable-fixits on source_path.
+        Runs clang++ -fsyntax-only -fdiagnostics-parseable-fixits on source_path
+        using the project's target_arch and include directories.
         If syntax errors exist, returns structured diagnostics, human-readable
         suggestions, and a repaired C/C++ source string that the user can choose
         to auto-apply or edit manually.
@@ -642,12 +646,47 @@ class FixerAgent:
         cur_path = env.get("PATH", "")
         env["PATH"] = os.pathsep.join(path_parts + ([cur_path] if cur_path else []))
 
+        root_dir = Path(__file__).resolve().parents[2]
+        cfg_file = Path(config_path) if config_path else (root_dir / "configs" / "config.yaml")
+        target_flags: list[str] = []
+        cfg_includes: list[str] = []
+        if cfg_file.is_file():
+            try:
+                cfg_data = yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+                comp_cfg = cfg_data.get("compiler", {}) or {}
+                arch = str(comp_cfg.get("target_arch", "") or "").strip()
+                if arch:
+                    target_flags.append(f"--target={arch}")
+                for inc in comp_cfg.get("include_dirs", []) or []:
+                    cfg_includes.append(str(inc))
+                for flg in comp_cfg.get("flags", []) or []:
+                    target_flags.append(str(flg))
+            except Exception:
+                pass
+
+        inc_candidates = [
+            str(Path(source_path).resolve().parent),
+            str(root_dir),
+            str(root_dir / "examples"),
+            str(root_dir / "include"),
+            str(root_dir / "src"),
+        ] + cfg_includes + list(include_dirs or [])
+        inc_flags: list[str] = []
+        seen_inc: set[str] = set()
+        for d in inc_candidates:
+            if d and d not in seen_inc and os.path.isdir(d):
+                seen_inc.add(d)
+                inc_flags.extend(["-I", d])
+
         cmd = [
             clang_bin,
             "-fsyntax-only",
             "-fdiagnostics-parseable-fixits",
             "-Wno-everything",
             "-ferror-limit=10",
+            *target_flags,
+            *inc_flags,
+            *list(extra_flags or []),
             source_path,
         ]
         try:

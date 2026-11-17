@@ -31,6 +31,7 @@ from memory.experience_store import ExperienceStore
 from pipeline import Pipeline
 from safety.analysis import SecurityAnalyzer
 from safety.controller import SafeOptimizationController
+from safety.validator import CandidateValidator
 from web_ui.app import WebUIServer
 
 
@@ -395,6 +396,43 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
         self.assertIn("candidate_text_bytes", eb)
         if eb["candidate_text_bytes"] is not None:
             self.assertIn(eb.get("l1i_cache_budget_ok"), (True, False))
+
+    def test_12_cwe14_rejects_under_sized_zero_store_and_prefiX_includes(self):
+        """Tightened CWE-14 rejects unrelated small zero stores standing in for larger memset; pre_fix resolves project include dirs."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            base_ir = Path(tmp) / "base.ll"
+            cand_ir = Path(tmp) / "cand.ll"
+            base_ir.write_text(
+                "define void @scrub(ptr %secret) {\n"
+                "entry:\n"
+                "  call void @llvm.memset.p0.i64(ptr %secret, i8 0, i64 64, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            # Candidate drops the 64-byte memset and only adds an unrelated 4-byte store i32 0
+            cand_ir.write_text(
+                "define void @scrub(ptr %secret) {\n"
+                "entry:\n"
+                "  %x = alloca i32, align 4\n"
+                "  store i32 0, ptr %x, align 4\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok, msg = CandidateValidator.check_security_invariants(str(base_ir), str(cand_ir))
+            self.assertFalse(ok)
+            self.assertIn("CWE-14", msg)
+
+            # pre_fix resolves headers located in passed include_dirs
+            from agents.fixer_agent import FixerAgent
+            inc_dir = Path(tmp) / "proj_inc"
+            inc_dir.mkdir()
+            (inc_dir / "custom_proj_hdr.hpp").write_text("#define MAGIC_OK 7\n", encoding="utf-8")
+            cpp_src = Path(tmp) / "uses_hdr.cpp"
+            cpp_src.write_text('#include "custom_proj_hdr.hpp"\nint main() { return MAGIC_OK; }\n', encoding="utf-8")
+            res = FixerAgent().pre_fix(str(cpp_src), include_dirs=[str(inc_dir)])
+            self.assertTrue(res["valid"])
 
 
 if __name__ == "__main__":

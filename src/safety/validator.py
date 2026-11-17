@@ -93,6 +93,29 @@ class CandidateValidator:
                     current_lines = []
         return funcs
 
+    @staticmethod
+    def _zero_store_bytes(ir_body: str) -> int:
+        """Sum total bytes explicitly zero-stored by scalar/vector store instructions."""
+        type_sizes = {
+            "i1": 1, "i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16,
+            "half": 2, "float": 4, "double": 8, "ptr": 8,
+        }
+        total = 0
+        # Scalar zero stores: store <ty> 0|null|zeroinitializer, ptr ...
+        for m in re.finditer(
+            r"\bstore\s+(i\d+|half|float|double|ptr)\s+(?:0|0\.0+e[+-]\d+|0\.0|null|zeroinitializer)\s*,",
+            ir_body,
+        ):
+            total += type_sizes.get(m.group(1), 4)
+        # Vector zero stores: store <N x ty> zeroinitializer, ptr ...
+        for m in re.finditer(
+            r"\bstore\s+<\s*(\d+)\s*x\s*(i\d+|half|float|double|ptr)\s*>\s+zeroinitializer\s*,",
+            ir_body,
+        ):
+            lanes = int(m.group(1))
+            total += lanes * type_sizes.get(m.group(2), 4)
+        return total
+
     @classmethod
     def check_security_invariants(cls, baseline_ir: str, candidate_ir: str) -> tuple[bool, str]:
         """Verify optimization passes preserved security-critical memory scrubs (CWE-14)."""
@@ -113,23 +136,47 @@ class CandidateValidator:
 
         base_funcs = cls._extract_ir_functions(base_text)
         cand_funcs = cls._extract_ir_functions(cand_text)
-        memset_pat = re.compile(r"\bcall\b[^\n]*@(?:llvm\.memset[^\s(]*|memset|explicit_bzero|memset_s)\b")
-        zero_store_pat = re.compile(
-            r"\bstore\s+(?:i\d+|ptr|float|double|<\d+\s*x\s*[^>]+>)\s+(?:0|0\.0+e\+00|null|zeroinitializer)\s*,"
-        )
+        memset_any_pat = re.compile(r"\bcall\b[^\n]*@(?:llvm\.memset[^\s(]*|memset|explicit_bzero|memset_s)\b([^\n]*)")
+        const_len_pat = re.compile(r",\s*i(?:32|64)\s+0\s*,\s*i(?:32|64)\s+(\d+)")
 
         for fn_name, base_body in base_funcs.items():
             if fn_name.startswith(("_ZNSt", "_ZSt", "_ZNKSt")) or fn_name not in cand_funcs:
                 continue
             cand_body = cand_funcs[fn_name]
-            base_clears = len(memset_pat.findall(base_body))
-            cand_clears = len(memset_pat.findall(cand_body))
-            if cand_clears < base_clears:
-                added_zeros = len(zero_store_pat.findall(cand_body)) - len(zero_store_pat.findall(base_body))
-                if added_zeros < (base_clears - cand_clears):
+            base_calls = memset_any_pat.findall(base_body)
+            cand_calls = memset_any_pat.findall(cand_body)
+            if len(cand_calls) < len(base_calls):
+                base_const_lens = []
+                cand_const_lens = []
+                for args in base_calls:
+                    m = const_len_pat.search(args)
+                    if not m:
+                        return False, (
+                            f"Rejected (CWE-14): Pass eliminated dynamic-length memory-scrubbing "
+                            f"memset call in '{fn_name}'."
+                        )
+                    base_const_lens.append(int(m.group(1)))
+                for args in cand_calls:
+                    m = const_len_pat.search(args)
+                    if m:
+                        cand_const_lens.append(int(m.group(1)))
+
+                # Only allow scalar zero-store replacement for small (<= 8 byte) compiler-scalarized inits
+                # AND require added zero-store bytes >= exact removed memset bytes.
+                large_base = [sz for sz in base_const_lens if sz > 8]
+                large_cand = [sz for sz in cand_const_lens if sz > 8]
+                if len(large_cand) < len(large_base) or sum(large_cand) < sum(large_base):
                     return False, (
-                        f"Rejected (CWE-14): Pass eliminated {base_clears - cand_clears} "
-                        f"memory-scrubbing memset call(s) in '{fn_name}' without zero-store replacement."
+                        f"Rejected (CWE-14): Pass eliminated multi-byte (>8B) memory-scrubbing "
+                        f"memset call(s) in '{fn_name}'."
+                    )
+
+                removed_bytes = max(0, sum(base_const_lens) - sum(cand_const_lens))
+                added_zero_bytes = max(0, cls._zero_store_bytes(cand_body) - cls._zero_store_bytes(base_body))
+                if added_zero_bytes < removed_bytes:
+                    return False, (
+                        f"Rejected (CWE-14): Pass eliminated {removed_bytes}B of memory-scrubbing "
+                        f"memset in '{fn_name}' (only {added_zero_bytes}B zero-stored)."
                     )
 
         return True, "Security invariants (CWE-14 memory scrubbing) preserved."
