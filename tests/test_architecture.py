@@ -424,6 +424,44 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("CWE-14", msg)
 
+            # Even if unrelated zero stores add up to the exact removed wipe size (8B == 8B),
+            # CWE-14 must reject because they do not clear the same memory (%secret).
+            base_8b = Path(tmp) / "base_8b.ll"
+            cand_unrelated_8b = Path(tmp) / "cand_unrelated_8b.ll"
+            cand_same_8b = Path(tmp) / "cand_same_8b.ll"
+            base_8b.write_text(
+                "define void @scrub8(ptr %secret) {\n"
+                "entry:\n"
+                "  call void @llvm.memset.p0.i64(ptr %secret, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_unrelated_8b.write_text(
+                "define void @scrub8(ptr %secret) {\n"
+                "entry:\n"
+                "  %other_a = alloca i32, align 4\n"
+                "  %other_b = alloca i32, align 4\n"
+                "  store i32 0, ptr %other_a, align 4\n"
+                "  store i32 0, ptr %other_b, align 4\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_same_8b.write_text(
+                "define void @scrub8(ptr %secret) {\n"
+                "entry:\n"
+                "  store i64 0, ptr %secret, align 8\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_unrel, msg_unrel = CandidateValidator.check_security_invariants(str(base_8b), str(cand_unrelated_8b))
+            self.assertFalse(ok_unrel)
+            self.assertIn("CWE-14", msg_unrel)
+            ok_same, _ = CandidateValidator.check_security_invariants(str(base_8b), str(cand_same_8b))
+            self.assertTrue(ok_same)
+
             # pre_fix resolves headers located in passed include_dirs
             from agents.fixer_agent import FixerAgent
             inc_dir = Path(tmp) / "proj_inc"

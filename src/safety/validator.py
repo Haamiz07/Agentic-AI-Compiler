@@ -94,27 +94,46 @@ class CandidateValidator:
         return funcs
 
     @staticmethod
-    def _zero_store_bytes(ir_body: str) -> int:
-        """Sum total bytes explicitly zero-stored by scalar/vector store instructions."""
+    def _zero_store_bytes_by_dest(ir_body: str) -> dict[str, int]:
+        """Map each store destination (including simple GEP bases) to total zero-stored bytes."""
         type_sizes = {
             "i1": 1, "i8": 1, "i16": 2, "i32": 4, "i64": 8, "i128": 16,
             "half": 2, "float": 4, "double": 8, "ptr": 8,
         }
-        total = 0
-        # Scalar zero stores: store <ty> 0|null|zeroinitializer, ptr ...
+        # Track simple GEP aliases: %gep = getelementptr ..., ptr %base, ...
+        alias_to_base: dict[str, str] = {}
         for m in re.finditer(
-            r"\bstore\s+(i\d+|half|float|double|ptr)\s+(?:0|0\.0+e[+-]\d+|0\.0|null|zeroinitializer)\s*,",
+            r"^\s*(%[\w.$]+)\s*=\s*(?:getelementptr|bitcast|addrspacecast)\b[^\n]*?\bptr\s+([%@][\w.$]+)",
+            ir_body,
+            re.MULTILINE,
+        ):
+            alias_to_base[m.group(1)] = m.group(2)
+
+        def _root(sym: str) -> str:
+            seen: set[str] = set()
+            cur = sym
+            while cur in alias_to_base and cur not in seen:
+                seen.add(cur)
+                cur = alias_to_base[cur]
+            return cur
+
+        totals: dict[str, int] = {}
+        # Scalar zero stores: store <ty> 0|null|zeroinitializer, ptr <dest>
+        for m in re.finditer(
+            r"\bstore\s+(i\d+|half|float|double|ptr)\s+(?:0|0\.0+e[+-]\d+|0\.0|null|zeroinitializer)\s*,\s*ptr\s+([%@][\w.$]+)",
             ir_body,
         ):
-            total += type_sizes.get(m.group(1), 4)
-        # Vector zero stores: store <N x ty> zeroinitializer, ptr ...
+            dest = _root(m.group(2))
+            totals[dest] = totals.get(dest, 0) + type_sizes.get(m.group(1), 4)
+        # Vector zero stores: store <N x ty> zeroinitializer, ptr <dest>
         for m in re.finditer(
-            r"\bstore\s+<\s*(\d+)\s*x\s*(i\d+|half|float|double|ptr)\s*>\s+zeroinitializer\s*,",
+            r"\bstore\s+<\s*(\d+)\s*x\s*(i\d+|half|float|double|ptr)\s*>\s+zeroinitializer\s*,\s*ptr\s+([%@][\w.$]+)",
             ir_body,
         ):
             lanes = int(m.group(1))
-            total += lanes * type_sizes.get(m.group(2), 4)
-        return total
+            dest = _root(m.group(3))
+            totals[dest] = totals.get(dest, 0) + lanes * type_sizes.get(m.group(2), 4)
+        return totals
 
     @classmethod
     def check_security_invariants(cls, baseline_ir: str, candidate_ir: str) -> tuple[bool, str]:
@@ -136,8 +155,11 @@ class CandidateValidator:
 
         base_funcs = cls._extract_ir_functions(base_text)
         cand_funcs = cls._extract_ir_functions(cand_text)
-        memset_any_pat = re.compile(r"\bcall\b[^\n]*@(?:llvm\.memset[^\s(]*|memset|explicit_bzero|memset_s)\b([^\n]*)")
-        const_len_pat = re.compile(r",\s*i(?:32|64)\s+0\s*,\s*i(?:32|64)\s+(\d+)")
+        memset_any_pat = re.compile(
+            r"\bcall\b[^\n]*@(?:llvm\.memset[^\s(]*|memset|explicit_bzero|memset_s)\b\s*\(([^\n]*)\)"
+        )
+        const_len_pat = re.compile(r",\s*i(?:8|32|64)\s+0\s*,\s*i(?:32|64)\s+(\d+)")
+        dest_pat = re.compile(r"([%@][\w.$]+)\s*$")
 
         for fn_name, base_body in base_funcs.items():
             if fn_name.startswith(("_ZNSt", "_ZSt", "_ZNKSt")) or fn_name not in cand_funcs:
@@ -146,38 +168,51 @@ class CandidateValidator:
             base_calls = memset_any_pat.findall(base_body)
             cand_calls = memset_any_pat.findall(cand_body)
             if len(cand_calls) < len(base_calls):
-                base_const_lens = []
-                cand_const_lens = []
+                # Map destination -> list of constant lengths in base and candidate
+                base_by_dest: dict[str, list[int]] = {}
                 for args in base_calls:
-                    m = const_len_pat.search(args)
-                    if not m:
+                    m_len = const_len_pat.search(args)
+                    if not m_len:
                         return False, (
                             f"Rejected (CWE-14): Pass eliminated dynamic-length memory-scrubbing "
                             f"memset call in '{fn_name}'."
                         )
-                    base_const_lens.append(int(m.group(1)))
+                    first_arg = args.split(",", 1)[0]
+                    m_dst = dest_pat.search(first_arg.strip())
+                    dst = m_dst.group(1) if m_dst else "<unknown>"
+                    base_by_dest.setdefault(dst, []).append(int(m_len.group(1)))
+
+                cand_by_dest: dict[str, list[int]] = {}
                 for args in cand_calls:
-                    m = const_len_pat.search(args)
-                    if m:
-                        cand_const_lens.append(int(m.group(1)))
+                    m_len = const_len_pat.search(args)
+                    if m_len:
+                        first_arg = args.split(",", 1)[0]
+                        m_dst = dest_pat.search(first_arg.strip())
+                        dst = m_dst.group(1) if m_dst else "<unknown>"
+                        cand_by_dest.setdefault(dst, []).append(int(m_len.group(1)))
 
-                # Only allow scalar zero-store replacement for small (<= 8 byte) compiler-scalarized inits
-                # AND require added zero-store bytes >= exact removed memset bytes.
-                large_base = [sz for sz in base_const_lens if sz > 8]
-                large_cand = [sz for sz in cand_const_lens if sz > 8]
-                if len(large_cand) < len(large_base) or sum(large_cand) < sum(large_base):
-                    return False, (
-                        f"Rejected (CWE-14): Pass eliminated multi-byte (>8B) memory-scrubbing "
-                        f"memset call(s) in '{fn_name}'."
-                    )
+                base_zero_dests = cls._zero_store_bytes_by_dest(base_body)
+                cand_zero_dests = cls._zero_store_bytes_by_dest(cand_body)
 
-                removed_bytes = max(0, sum(base_const_lens) - sum(cand_const_lens))
-                added_zero_bytes = max(0, cls._zero_store_bytes(cand_body) - cls._zero_store_bytes(base_body))
-                if added_zero_bytes < removed_bytes:
-                    return False, (
-                        f"Rejected (CWE-14): Pass eliminated {removed_bytes}B of memory-scrubbing "
-                        f"memset in '{fn_name}' (only {added_zero_bytes}B zero-stored)."
-                    )
+                for dst, base_lens in base_by_dest.items():
+                    cand_lens = cand_by_dest.get(dst, [])
+                    if len(cand_lens) >= len(base_lens) and sum(cand_lens) >= sum(base_lens):
+                        continue
+                    # Only allow scalar zero-store replacement for small (<=8B) constant wipes
+                    # when the added zero stores target the EXACT SAME destination pointer.
+                    if any(sz > 8 for sz in base_lens) or dst == "<unknown>":
+                        return False, (
+                            f"Rejected (CWE-14): Pass eliminated multi-byte (>8B) or untracked "
+                            f"memory-scrubbing memset on '{dst}' in '{fn_name}'."
+                        )
+                    removed_bytes = max(0, sum(base_lens) - sum(cand_lens))
+                    added_on_dst = max(0, cand_zero_dests.get(dst, 0) - base_zero_dests.get(dst, 0))
+                    if added_on_dst < removed_bytes:
+                        return False, (
+                            f"Rejected (CWE-14): Pass eliminated {removed_bytes}B memset on '{dst}' "
+                            f"in '{fn_name}' without matching zero-stores on '{dst}' "
+                            f"(only {added_on_dst}B on same destination)."
+                        )
 
         return True, "Security invariants (CWE-14 memory scrubbing) preserved."
 
