@@ -123,11 +123,28 @@ class CandidateValidator:
 
     @staticmethod
     def _pointer_expression_key(ir_body: str, sym: str) -> str:
-        """Canonicalize bitcasts and retain complete GEP indices in pointer identity."""
+        """Canonicalize bitcasts and retain GEP type, base, and evaluated index expressions."""
         definitions = {
             m.group(1): m.group(2)
             for m in re.finditer(r"^\s*(%[\w.$]+)\s*=\s*(.*?)\s*$", ir_body, re.MULTILINE)
         }
+
+        def value_key(value: str, seen: set[str]) -> str:
+            """Include an index SSA value's definition so same-named changed indices differ."""
+            if value in seen:
+                return f"cycle:{value}"
+            rhs = definitions.get(value, "")
+            if not rhs:
+                return value
+            if rhs.startswith(("getelementptr ", "bitcast ")):
+                return resolve(value, seen.copy())
+            nested_seen = seen | {value}
+            normalized = re.sub(
+                r"%[\w.$]+",
+                lambda m: value_key(m.group(0), nested_seen.copy()),
+                rhs,
+            )
+            return f"value:{' '.join(normalized.split())}"
 
         def resolve(value: str, seen: set[str]) -> str:
             if value in seen:
@@ -141,8 +158,15 @@ class CandidateValidator:
             if rhs.startswith("getelementptr "):
                 gep = re.search(r"\bptr\s+([%@][\w.$]+)(.*)$", rhs)
                 if gep:
-                    indices = " ".join(gep.group(2).split())
-                    return f"gep:{resolve(gep.group(1), seen)}:{indices}"
+                    source_type = " ".join(rhs[:gep.start()].split())
+                    indices = re.sub(
+                        r"%[\w.$]+",
+                        lambda m: value_key(m.group(0), seen.copy()),
+                        gep.group(2),
+                    )
+                    indices = " ".join(indices.split())
+                    base = resolve(gep.group(1), seen.copy())
+                    return f"gep:{source_type}:{base}:{indices}"
             if rhs:
                 # Keep the SSA identity so two same-shaped allocas/loads are not
                 # accidentally treated as the same address.

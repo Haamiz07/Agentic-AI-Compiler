@@ -545,6 +545,63 @@ class TestSecureAgenticCompilerArchitecture(unittest.TestCase):
             )
             self.assertTrue(ok_gep_same)
 
+            # A same-named dynamic GEP index whose definition changes is a
+            # different destination, even when the GEP instruction text uses %idx.
+            base_dynamic_gep = Path(tmp) / "base_dynamic_gep.ll"
+            cand_dynamic_gep = Path(tmp) / "cand_dynamic_gep.ll"
+            base_dynamic_gep.write_text(
+                "define void @scrub_dynamic(ptr %secret, i64 %n) {\n"
+                "entry:\n"
+                "  %idx = add i64 %n, 0\n"
+                "  %p = getelementptr i8, ptr %secret, i64 %idx\n"
+                "  call void @llvm.memset.p0.i64(ptr %p, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_dynamic_gep.write_text(
+                "define void @scrub_dynamic(ptr %secret, i64 %n) {\n"
+                "entry:\n"
+                "  %idx = add i64 %n, 1\n"
+                "  %p = getelementptr i8, ptr %secret, i64 %idx\n"
+                "  store i64 0, ptr %p, align 8\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_dynamic_gep, msg_dynamic_gep = CandidateValidator.check_security_invariants(
+                str(base_dynamic_gep), str(cand_dynamic_gep)
+            )
+            self.assertFalse(ok_dynamic_gep)
+            self.assertIn("CWE-14", msg_dynamic_gep)
+
+            # GEP source element type affects the byte offset even if indices match.
+            cand_gep_wrong_type = Path(tmp) / "cand_gep_wrong_type.ll"
+            base_gep_type = Path(tmp) / "base_gep_type.ll"
+            base_gep_type.write_text(
+                "define void @scrub_gep_type(ptr %secret) {\n"
+                "entry:\n"
+                "  %p = getelementptr i8, ptr %secret, i64 1\n"
+                "  call void @llvm.memset.p0.i64(ptr %p, i8 0, i64 8, i1 false)\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            cand_gep_wrong_type.write_text(
+                "define void @scrub_gep_type(ptr %secret) {\n"
+                "entry:\n"
+                "  %p = getelementptr i64, ptr %secret, i64 1\n"
+                "  store i64 0, ptr %p, align 8\n"
+                "  ret void\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            ok_gep_type, msg_gep_type = CandidateValidator.check_security_invariants(
+                str(base_gep_type), str(cand_gep_wrong_type)
+            )
+            self.assertFalse(ok_gep_type)
+            self.assertIn("CWE-14", msg_gep_type)
+
             # Identically-shaped allocas remain distinct destinations.
             base_local = Path(tmp) / "base_local.ll"
             cand_other_local = Path(tmp) / "cand_other_local.ll"
