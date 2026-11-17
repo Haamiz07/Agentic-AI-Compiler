@@ -80,6 +80,7 @@ function render(data) {
   renderAntiPatterns(data);
   renderPassTimeline(data);
   renderSafetyReview(data);
+  renderProvenance(data);
   renderRewardBreakdown(data);
   renderBenchmark(data);
   renderExplainability(data);
@@ -356,6 +357,66 @@ function renderSafetyReview(data) {
           ${feedbackHtml}
         </article>`;
     }).join('') : '<div class="safety-empty">No pass decisions recorded for this run. Run a fresh compile to populate this panel.</div>';
+  }
+}
+
+/* ── Build provenance and artifact integrity ──────────────────────────── */
+function renderProvenance(data) {
+  const reportPath = typeof data.provenance_path === 'string' ? data.provenance_path : '';
+  const pathEl = document.getElementById('provenancePath');
+  const button = document.getElementById('btnVerifyProvenance');
+  const status = document.getElementById('provenanceStatus');
+  const artifacts = document.getElementById('provenanceArtifacts');
+  if (pathEl) pathEl.textContent = reportPath || 'No provenance report for this run.';
+  if (button) button.disabled = !reportPath;
+  if (status) {
+    status.className = 'integrity-status';
+    status.textContent = reportPath ? 'Report ready. Verify to check the recorded files.' : 'Compile an example to generate a provenance report.';
+  }
+  if (artifacts) artifacts.innerHTML = '';
+}
+
+async function verifyLatestProvenance() {
+  const button = document.getElementById('btnVerifyProvenance');
+  const status = document.getElementById('provenanceStatus');
+  const artifacts = document.getElementById('provenanceArtifacts');
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  button.textContent = 'Checking…';
+  if (status) {
+    status.className = 'integrity-status';
+    status.textContent = 'Checking the latest build report…';
+  }
+  if (artifacts) artifacts.innerHTML = '';
+
+  try {
+    const response = await fetch('/api/provenance/verify', { method: 'POST' });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    const result = payload.verification || {};
+    const valid = result.valid_manifest === true;
+    if (status) {
+      status.className = `integrity-status ${valid ? 'is-good' : 'is-bad'}`;
+      const origin = result.ir_origin ? ` · IR origin: ${result.ir_origin}` : '';
+      status.textContent = `${valid ? 'All recorded artifact hashes match.' : 'One or more artifacts failed verification (missing, unavailable, or changed).'}${origin}`;
+    }
+    if (artifacts) {
+      const rows = Array.isArray(result.artifacts) ? result.artifacts : [];
+      artifacts.innerHTML = rows.map(item => `
+        <div class="integrity-artifact">
+          <strong>${esc(item.role || 'artifact')}</strong>
+          <span class="${item.matches ? 'is-good' : 'is-bad'}">${item.matches ? 'Match' : esc(item.reason || 'Mismatch')}</span>
+        </div>
+      `).join('');
+    }
+  } catch (error) {
+    if (status) {
+      status.className = 'integrity-status is-bad';
+      status.textContent = `Verification could not complete: ${error.message}`;
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Verify artifacts';
   }
 }
 
@@ -708,5 +769,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (selectEl) {
     selectEl.addEventListener('change', (e) => loadSourceIntoEditor(e.target.value));
   }
+  const verifyButton = document.getElementById('btnVerifyProvenance');
+  if (verifyButton) verifyButton.addEventListener('click', verifyLatestProvenance);
   pollTimer = setInterval(fetchResults, POLL_INTERVAL);
 });

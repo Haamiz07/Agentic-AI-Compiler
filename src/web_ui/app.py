@@ -38,6 +38,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 DEFAULT_RESULTS_PATH = "/tmp/agentic_c/results_latest.json"
 DEFAULT_PORT = 5050
+DEFAULT_PROVENANCE_DIR = Path(tempfile.gettempdir()) / "agentic_c" / "ir"
 
 
 class AGenticHandler(http.server.SimpleHTTPRequestHandler):
@@ -49,6 +50,7 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
     """
 
     results_path = DEFAULT_RESULTS_PATH
+    provenance_dir = DEFAULT_PROVENANCE_DIR
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_DIR), **kwargs)
@@ -86,6 +88,9 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
         try:
             if path == "/api/compile":
                 self._handle_compile()
+                return
+            if path == "/api/provenance/verify":
+                self._verify_latest_provenance()
                 return
             from safety.attack_lab import build_report, save_report
             source_path = self._latest_source_path()
@@ -314,6 +319,40 @@ class AGenticHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_error(500, str(e))
 
+    def _verify_latest_provenance(self):
+        """Verify the manifest attached to the latest results, never a client path."""
+        try:
+            with open(self.results_path, encoding="utf-8") as stream:
+                latest = json.load(stream)
+        except (OSError, json.JSONDecodeError):
+            self._send_json({"ok": False, "error": "No completed pipeline result is available."}, status=404)
+            return
+
+        recorded_path = latest.get("provenance_path")
+        if not isinstance(recorded_path, str) or not recorded_path.strip():
+            self._send_json({"ok": False, "error": "The latest run has no provenance report."}, status=404)
+            return
+
+        manifest_path = Path(recorded_path).expanduser().resolve()
+        allowed_dir = Path(self.provenance_dir).expanduser().resolve()
+        try:
+            manifest_path.relative_to(allowed_dir)
+        except ValueError:
+            self._send_json({"ok": False, "error": "The recorded provenance report is outside the compiler output directory."}, status=403)
+            return
+
+        if not manifest_path.name.endswith(".provenance.json"):
+            self._send_json({"ok": False, "error": "The recorded file is not a provenance report."}, status=400)
+            return
+
+        from safety.provenance import verify_provenance_manifest
+        verification = verify_provenance_manifest(manifest_path)
+        self._send_json({
+            "ok": True,
+            "manifest_path": str(manifest_path),
+            "verification": verification,
+        })
+
     def log_message(self, format, *args):
         # Suppress request logs — keep console clean during demo
         pass
@@ -327,14 +366,20 @@ class WebUIServer:
 
     def __init__(self,
                  results_path: str = DEFAULT_RESULTS_PATH,
-                 port:         int = DEFAULT_PORT):
+                 port:         int = DEFAULT_PORT,
+                 provenance_dir: str | None = None):
         self.results_path = results_path
         self.port = port
+        self.provenance_dir = (
+            Path(provenance_dir).expanduser().resolve()
+            if provenance_dir else DEFAULT_PROVENANCE_DIR.resolve()
+        )
         self._server = None
         self._thread = None
 
         # Inject results path into handler class
         AGenticHandler.results_path = results_path
+        AGenticHandler.provenance_dir = self.provenance_dir
 
     def start(self) -> bool:
         """Start the server in a background thread. Returns True if successful."""
@@ -411,6 +456,7 @@ def pipeline_result_to_dict(pipeline_result,
         "notes":              getattr(result, "notes", ""),
         # Experience-learning fields (new)
         "binary_path":        getattr(result, "binary_path", ""),
+        "provenance_path":    getattr(result, "provenance_path", ""),
         "used_cached_sequence": getattr(result, "used_cached_sequence", False),
         "experience_hits":    getattr(result, "experience_hits", 0),
         "security_findings": [

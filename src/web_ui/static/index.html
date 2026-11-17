@@ -427,6 +427,26 @@
   </div>
 </section>
 
+<!-- ── Build provenance / artifact integrity ──────────────────────────── -->
+<section class="section" style="padding-top:0">
+  <div class="container">
+    <div class="card">
+      <div class="integrity-header">
+        <div>
+          <div class="card-title">Build Integrity</div>
+          <p class="integrity-description">Check whether the source, final LLVM IR, and executable still match the hashes recorded for this build.</p>
+        </div>
+        <button class="btn-refresh" type="button" id="btnVerifyProvenance" disabled>Verify artifacts</button>
+      </div>
+      <div class="integrity-path-label">Provenance report</div>
+      <code class="integrity-path" id="provenancePath">Run a compile to create a report.</code>
+      <div class="integrity-status" id="provenanceStatus" aria-live="polite">No build report loaded.</div>
+      <div class="integrity-artifacts" id="provenanceArtifacts"></div>
+      <p class="safety-footnote">A matching hash means the recorded file is unchanged. This report is unsigned and does not certify that the program is secure.</p>
+    </div>
+  </div>
+</section>
+
 <!-- ── Reward Breakdown ────────────────────────────────────────────────── -->
 <section class="section" style="padding-top:0">
   <div class="container">
