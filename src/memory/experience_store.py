@@ -236,6 +236,16 @@ class SQLiteStore:
         ]
 
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
+        a = np.asarray(a, dtype=np.float32).ravel()
+        b = np.asarray(b, dtype=np.float32).ravel()
+        if a.size == 0 or b.size == 0:
+            return 0.0
+        if a.shape != b.shape:
+            target = max(a.size, b.size)
+            if a.size < target:
+                a = np.pad(a, (0, target - a.size), mode="wrap")
+            if b.size < target:
+                b = np.pad(b, (0, target - b.size), mode="wrap")
         na, nb = np.linalg.norm(a), np.linalg.norm(b)
         if na == 0 or nb == 0:
             return 0.0

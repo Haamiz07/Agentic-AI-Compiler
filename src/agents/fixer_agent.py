@@ -610,6 +610,211 @@ class FixerAgent:
         """Delegate to HFTFixer."""
         return self.hft_fixer.hft_fix(source_snippet, unit_name, path_label)
 
+    def pre_fix(self, source_path: str,
+                config_path: Optional[str] = None,
+                include_dirs: Optional[list[str]] = None,
+                extra_flags: Optional[list[str]] = None) -> dict:
+        """
+        Pre-IR Syntax Check & Automated Repair (Fixer Agent).
+        Runs clang++ -fsyntax-only -fdiagnostics-parseable-fixits on source_path
+        using the project's target_arch and include directories.
+        If syntax errors exist, returns structured diagnostics, human-readable
+        suggestions, and a repaired C/C++ source string that the user can choose
+        to auto-apply or edit manually.
+        """
+        if not source_path or not os.path.exists(source_path):
+            return {"valid": True, "errors": [], "repaired_source": None, "can_auto_fix": False}
+
+        try:
+            from safety.validator import _locate_tool, _DEFAULT_TOOLCHAIN_DIRS
+        except ImportError:
+            try:
+                from src.safety.validator import _locate_tool, _DEFAULT_TOOLCHAIN_DIRS
+            except ImportError:
+                return {"valid": True, "errors": [], "repaired_source": None, "can_auto_fix": False}
+
+        is_cpp = Path(source_path).suffix.lower() in (".cpp", ".cc", ".cxx", ".hpp")
+        clang_bin = _locate_tool("", ("clang++", "clang") if is_cpp else ("clang", "clang++"))
+        if not clang_bin:
+            return {"valid": True, "errors": [], "repaired_source": None, "can_auto_fix": False}
+
+        env = dict(os.environ)
+        path_parts = [p for p in _DEFAULT_TOOLCHAIN_DIRS if os.path.isdir(p)]
+        t_dir = str(Path(clang_bin).parent)
+        if t_dir not in path_parts:
+            path_parts.insert(0, t_dir)
+        cur_path = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(path_parts + ([cur_path] if cur_path else []))
+
+        root_dir = Path(__file__).resolve().parents[2]
+        cfg_file = Path(config_path) if config_path else (root_dir / "configs" / "config.yaml")
+        target_flags: list[str] = []
+        cfg_includes: list[str] = []
+        if cfg_file.is_file():
+            try:
+                cfg_data = yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}
+                comp_cfg = cfg_data.get("compiler", {}) or {}
+                arch = str(comp_cfg.get("target_arch", "") or "").strip()
+                if arch:
+                    target_flags.append(f"--target={arch}")
+                for inc in comp_cfg.get("include_dirs", []) or []:
+                    cfg_includes.append(str(inc))
+                for flg in comp_cfg.get("flags", []) or []:
+                    target_flags.append(str(flg))
+            except Exception:
+                pass
+
+        inc_candidates = [
+            str(Path(source_path).resolve().parent),
+            str(root_dir),
+            str(root_dir / "examples"),
+            str(root_dir / "include"),
+            str(root_dir / "src"),
+        ] + cfg_includes + list(include_dirs or [])
+        inc_flags: list[str] = []
+        seen_inc: set[str] = set()
+        for d in inc_candidates:
+            if d and d not in seen_inc and os.path.isdir(d):
+                seen_inc.add(d)
+                inc_flags.extend(["-I", d])
+
+        cmd = [
+            clang_bin,
+            "-fsyntax-only",
+            "-fdiagnostics-parseable-fixits",
+            "-Wno-everything",
+            "-ferror-limit=10",
+            *target_flags,
+            *inc_flags,
+            *list(extra_flags or []),
+            source_path,
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env)
+        except Exception as exc:
+            self._log(f"pre_fix check skipped: {exc}")
+            return {"valid": True, "errors": [], "repaired_source": None, "can_auto_fix": False}
+
+        if proc.returncode == 0:
+            return {"valid": True, "errors": [], "repaired_source": None, "can_auto_fix": False}
+
+        raw_err = (proc.stderr or proc.stdout or "").strip()
+        source_text = Path(source_path).read_text(encoding="utf-8", errors="replace")
+        src_lines = source_text.splitlines()
+
+        # 1. Parse Clang machine-readable fix-it hints:
+        #    fix-it:"path":{start_line:start_col-end_line:end_col}:"replacement"
+        fixit_pattern = re.compile(
+            r'fix-it:"(?:[^"\\]|\\.)*":\{(\d+):(\d+)-(\d+):(\d+)\}:"((?:[^"\\]|\\.)*)"'
+        )
+        fixits = []
+        for m in fixit_pattern.finditer(raw_err):
+            sl, sc, el, ec = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+            repl = m.group(5).replace(r'\"', '"').replace(r'\\', '\\').replace(r'\n', '\n').replace(r'\t', '\t')
+            fixits.append((sl, sc, el, ec, repl))
+
+        # 2. Parse human-readable Clang error lines:
+        #    file.cpp:line:col: error: message
+        err_pattern = re.compile(r'^.*?:(\d+):(\d+):\s*(?:fatal\s+)?error:\s*(.+)$', re.MULTILINE)
+        errors = []
+        for m in err_pattern.finditer(raw_err):
+            lno, cno, msg = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+            snippet = src_lines[lno - 1] if 1 <= lno <= len(src_lines) else ""
+
+            # Match with a fix-it if one targets this line or the immediately preceding line
+            matched_fix = None
+            for (sl, sc, el, ec, repl) in fixits:
+                if sl in (lno, lno - 1):
+                    matched_fix = (sl, sc, el, ec, repl)
+                    break
+
+            if matched_fix:
+                sl, sc, _, _, repl = matched_fix
+                target_snip = src_lines[sl - 1].strip() if 1 <= sl <= len(src_lines) else ""
+                suggestion = f"Insert '{repl}' at line {sl}, column {sc}" + (f" (on line: `{target_snip}`)" if target_snip else "")
+            elif "expected ';'" in msg:
+                suggestion = f"Add missing semicolon ';' at the end of the statement near line {lno}."
+            elif "expected '}'" in msg:
+                suggestion = f"Add missing closing brace '}}' near line {lno}."
+            elif "expected ')'" in msg:
+                suggestion = f"Add missing closing parenthesis ')' near line {lno}."
+            else:
+                suggestion = f"Resolve syntax error at line {lno}, column {cno}: {msg}"
+
+            errors.append({
+                "line": lno,
+                "column": cno,
+                "message": msg,
+                "snippet": snippet,
+                "suggestion": suggestion,
+            })
+
+        # 3. Build repaired source code
+        repaired_lines = source_text.splitlines(keepends=True)
+        applied_any = False
+
+        if fixits:
+            # Sort in reverse order of position so earlier insertions don't shift later columns
+            seen_fixits = sorted(set(fixits), key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
+            for (sl, sc, el, ec, repl) in seen_fixits:
+                if 1 <= sl <= len(repaired_lines) and sl == el:
+                    line_str = repaired_lines[sl - 1]
+                    # Preserve line ending (\r\n or \n)
+                    ending = ""
+                    if line_str.endswith("\r\n"):
+                        ending = "\r\n"
+                        content = line_str[:-2]
+                    elif line_str.endswith("\n"):
+                        ending = "\n"
+                        content = line_str[:-1]
+                    else:
+                        content = line_str
+                    idx_s = max(0, min(len(content), sc - 1))
+                    idx_e = max(idx_s, min(len(content), ec - 1))
+                    repaired_lines[sl - 1] = content[:idx_s] + repl + content[idx_e:] + ending
+                    applied_any = True
+
+        # Fallback heuristic if Clang reported expected ';' / '}' without a parseable fix-it
+        if not applied_any and errors:
+            for err in errors:
+                msg = err["message"]
+                lno = err["line"]
+                if "expected ';'" in msg and 1 <= lno <= len(repaired_lines):
+                    # Check if the missing semicolon belongs at the end of the previous non-empty line
+                    target_idx = lno - 1
+                    if err["column"] <= 5 and lno >= 2:
+                        prev_idx = lno - 2
+                        while prev_idx >= 0 and not repaired_lines[prev_idx].strip():
+                            prev_idx -= 1
+                        if prev_idx >= 0:
+                            target_idx = prev_idx
+                    line_str = repaired_lines[target_idx]
+                    ending = "\r\n" if line_str.endswith("\r\n") else ("\n" if line_str.endswith("\n") else "")
+                    body = line_str[:-len(ending)] if ending else line_str
+                    # Strip inline comment before appending ';'
+                    comment_part = ""
+                    if "//" in body:
+                        code_part, comment_part = body.split("//", 1)
+                        comment_part = " //" + comment_part
+                        body = code_part.rstrip()
+                    if not body.rstrip().endswith(";"):
+                        repaired_lines[target_idx] = body.rstrip() + ";" + comment_part + ending
+                        applied_any = True
+                elif "expected '}'" in msg:
+                    repaired_lines.append("\n}\n")
+                    applied_any = True
+
+        repaired_source = "".join(repaired_lines) if applied_any else None
+        can_auto_fix = bool(repaired_source and repaired_source != source_text)
+
+        return {
+            "valid": False,
+            "errors": errors,
+            "raw_diagnostics": raw_err,
+            "repaired_source": repaired_source if can_auto_fix else None,
+            "can_auto_fix": can_auto_fix,
+        }
+
     def _log(self, msg: str):
         print(f"[FixerAgent] {msg}")
 

@@ -138,7 +138,8 @@ class Frontend:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=30       # 30s timeout — compilation shouldn't take longer
+                timeout=30,      # 30s timeout — compilation shouldn't take longer
+                env=self._build_env(),
             )
             elapsed_ms = (time.time() - start) * 1000
 
@@ -211,14 +212,25 @@ class Frontend:
         Build the clang command list.
 
         -O0              → no optimization, raw IR (agents do the optimizing)
+        -Xclang -disable-O0-optnone → allow downstream LLVM opt passes to transform functions
+        -gline-tables-only → emit !dbg / !DILocation metadata for source-to-IR security tracing
         -emit-llvm       → output LLVM IR instead of object code
         -S               → output text format (.ll) not binary (.bc)
         -Wno-everything  → suppress warnings, we only care about errors
         -ferror-limit=20 → cap errors at 20 (avoid megabyte stderr dumps)
         """
+        compiler = self.clang_path
+        if self.detect_language(source_path) == "cpp":
+            if compiler.endswith("clang") or compiler.endswith("clang.exe"):
+                cxx = compiler.replace("clang.exe", "clang++.exe") if compiler.endswith(".exe") else compiler + "++"
+                if os.path.exists(cxx) or shutil.which(cxx):
+                    compiler = cxx
         cmd = [
-            self.clang_path,
+            compiler,
             "-O0",
+            "-Xclang",
+            "-disable-O0-optnone",
+            "-gline-tables-only",
             "-emit-llvm",
             "-S",
             "-Wno-everything",       # suppress warnings during IR generation
@@ -226,11 +238,6 @@ class Frontend:
             source_path,
             "-o", ir_path,
         ]
-
-        # Add target triple only if not using system default
-        # (system default is usually correct for native compilation)
-        # Uncomment if cross-compilation is needed:
-        # cmd += [f"--target={self.target_arch}"]
 
         return cmd
 
@@ -371,17 +378,23 @@ class Frontend:
     def _find_clang(self) -> str:
         """
         Find clang binary. Priority:
-          1. 'clang' on system PATH (Xcode clang on Mac)
-          2. Common locations
+          1. 'clang' on system PATH
+          2. MSYS2 / LLVM / Xcode standard installation locations
         """
         # Try system PATH first
         clang = shutil.which("clang")
         if clang:
             return clang
 
-        # Common Mac locations
+        # Common Windows / Mac / Linux locations
         candidates = [
+            r"C:\msys64\clang64\bin\clang.exe",
+            r"C:\msys64\ucrt64\bin\clang.exe",
+            r"C:\msys64\mingw64\bin\clang.exe",
+            r"C:\Program Files\LLVM\bin\clang.exe",
             "/usr/bin/clang",
+            "/opt/homebrew/opt/llvm/bin/clang",
+            "/usr/local/opt/llvm/bin/clang",
             "/Applications/Xcode.app/Contents/Developer/Toolchains/"
             "XcodeDefault.xctoolchain/usr/bin/clang",
         ]
@@ -390,9 +403,15 @@ class Frontend:
                 return c
 
         raise RuntimeError(
-            "Clang not found. Install Xcode Command Line Tools:\n"
-            "  xcode-select --install"
+            "Clang not found. Install LLVM/Clang or Xcode Command Line Tools."
         )
+
+    def _build_env(self) -> dict:
+        env = dict(os.environ)
+        clang_dir = str(Path(self.clang_path).parent)
+        cur = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join([clang_dir, cur] if cur else [clang_dir])
+        return env
 
     def _get_clang_version(self) -> str:
         """Get clang version string for metadata."""

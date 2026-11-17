@@ -1,0 +1,165 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=0.85in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{navy}{HTML}{17365D}
+\definecolor{teal}{HTML}{006666}
+\definecolor{lightblue}{HTML}{EAF1F8}
+\definecolor{lightgreen}{HTML}{EDF7ED}
+\definecolor{lightwarn}{HTML}{FFF8E1}
+
+\setlist[itemize]{leftmargin=1.35em,itemsep=2pt,topsep=3pt}
+\setlist[enumerate]{leftmargin=1.35em,itemsep=2pt,topsep=3pt}
+\renewcommand{\arraystretch}{1.25}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\title{\vspace{-1.2em}\textbf{Architecture Progress \& Implementation Status Report}\\
+\large Agentic AI Compiler Optimization System with Safety \& Attack Lab}
+\author{\textbf{Haamiz Suhail Hakeem} (25CSB1A70) \quad \textbf{Shrot Amish Parekh} (25CSB1A62)}
+\date{Current as of 9 October 2026}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+
+\begin{abstract}
+This report provides an architectural and implementation evaluation of the Agentic AI Compiler Optimization System. Following the completion of all planned engineering milestones, the team has implemented the full end-to-end architecture: real Clang/LLVM IR frontend with debug-line metadata, source and IR security analysis with \texttt{!dbg} traceability, live compiler entrance prompt-injection filtering, security-informed planner agents (\texttt{BossAgent}, \texttt{IRTunerAgent}, \texttt{HWTunerAgent}), closed-loop critic feedback in \texttt{SafeOptimizationController}, multi-fixture candidate validation with empirical wall-clock binary microbenchmarking, interactive source editing and compilation in the Web UI, and the Attack Lab security evaluation suite. Both the \textbf{Safety Boundary \& Attack Simulation milestone} and the \textbf{Full End-to-End Autonomous System now stand at 100\% completion}.
+\end{abstract}
+
+\section{System Architecture Overview}
+The target architecture transforms an inherited, unconstrained prototype into a robust, policy-governed compiler where agent optimization decisions are constrained, validated, and resilient against adversarial inputs.
+
+\begin{center}
+\fcolorbox{navy}{lightblue}{\parbox{0.95\linewidth}{\centering
+\textbf{Target End-to-End Compilation \& Verification Pipeline:}\\[4pt]
+C/C++ Source $\longrightarrow$ Clang Frontend (LLVM IR) $\longrightarrow$ Security Analysis Scan $\longrightarrow$ \\
+Planner Agent (with attack-aware reasoning) $\longleftrightarrow$ Policy Gate (Fail-Closed Allowlist) $\longrightarrow$ \\
+LLVM Pass Runner (opt + verify) $\longrightarrow$ Verifier (compile + fixtures + benchmark) $\longrightarrow$ Memory \& Report
+}}
+\end{center}
+
+\section{Component-by-Component Completion Status}
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabularx}{\linewidth}{@{}p{0.25\linewidth}p{0.14\linewidth}Y@{}}
+\toprule
+\textbf{Architecture Module} & \textbf{Status} & \textbf{Implementation Details \& Current State} \\
+\midrule
+\textbf{1. C/C++ Source} & \textbf{100\% Done} & Benchmark HFT programs (\texttt{market\_maker.cpp}, \texttt{hft\_strategy.cpp}, \texttt{order\_book\_engine.cpp}) in \texttt{examples/} plus interactive Web UI source editor. \\
+\textbf{2. Clang Frontend} & \textbf{100\% Done} & Translates C/C++ source to real LLVM IR (\texttt{-O0 -Xclang -disable-O0-optnone -gline-tables-only}) in \texttt{src/core/frontend.py} and \texttt{src/pipeline.py}. \\
+\textbf{3. Security Analysis} & \textbf{100\% Done} & \texttt{SecurityAnalyzer} in \texttt{src/safety/analysis.py} scans source and IR for CWE-242, CWE-120, risky C-runtime calls, and \texttt{!dbg} $\rightarrow$ \texttt{!DILocation} source line traceability, plus \texttt{summarize\_for\_planner()}. \\
+\textbf{4. Attack Simulation \& Detection} & \textbf{100\% Done} & 60+ scenarios in \texttt{security\_scenarios.json} and held-out testbed; live entrance prompt-injection guard (\texttt{scan\_adversarial\_directives()}) at Stage 0 in \texttt{src/pipeline.py}; standalone Attack Lab UI with Precision, Recall, and F1 calculation. \\
+\textbf{5. Policy Gate} & \textbf{100\% Done} & Strict, fail-closed allowlist of 17 LLVM middle-end passes in \texttt{src/safety/policy.py} configured via \texttt{configs/config.yaml}. \\
+\textbf{6. LLVM Pass Runner} & \textbf{100\% Done} & Subprocess-safe invocation of \texttt{opt -passes=...} followed by \texttt{opt -passes=verify} in \texttt{src/safety/runner.py}. \\
+\textbf{7. Candidate Validator} & \textbf{100\% Done} & \texttt{CandidateValidator} compiles baseline and candidate IR via \texttt{clang++} and validates behavioral equivalence across multiple representative stdin fixtures (\texttt{""}, \texttt{"100\textbackslash n"}, \texttt{"1000 250 5\textbackslash n"}). \\
+\textbf{8. Planner Agent Loop} & \textbf{100\% Done} & \texttt{BossAgent}, \texttt{IRTunerAgent}, and \texttt{HWTunerAgent} ingest \texttt{security\_findings} and \texttt{critic\_feedback}; \texttt{SafeOptimizationController} closes the inner loop with automatic allowlisted fallback pass injection. \\
+\textbf{9. Empirical Benchmarking} & \textbf{100\% Done} & \texttt{CandidateValidator.\_benchmark\_runs()} executes warm-up and multi-iteration wall-clock microbenchmarks comparing compiled baseline and candidate binaries alongside \texttt{LatencyCostModel}. \\
+\textbf{10. Dashboard \& Reporting} & \textbf{100\% Done} & 8-stage pipeline flow visualization, interactive C/C++ source editor \& live compilation trigger (\texttt{/api/source}, \texttt{/api/compile}), Safety Checks \& Policy Gate critic feedback audit cards, empirical latency delta badges, and Attack Lab UI. \\
+\bottomrule
+\end{tabularx}
+\caption{Implementation status against the proposed architecture.}
+\end{table}
+
+\section{Detailed Progress by Category}
+
+\subsection{Completed: Safety Boundary \& Controlled Execution (Milestone 1)}
+\begin{itemize}
+  \item \textbf{Fail-Closed Allowlist:} Any pass outside the reviewed 17 LLVM middle-end passes (or actions with invalid characters or shell commands) is rejected automatically without shell invocation.
+  \item \textbf{Verification Gate:} Modified IR must compile with Clang and execute cleanly against configured fixtures before candidate acceptance. If any check fails, the pipeline safely falls back to baseline IR.
+  \item \textbf{Configuration Fix:} Configured `\texttt{behavior\_inputs: [""]}` as the default smoke fixture in \texttt{configs/config.yaml}, resolving the previous issue where empty fixture lists caused all candidates to fail-closed.
+\end{itemize}
+
+\subsection{Completed: Attack Lab \& PBL Security Evaluation (Milestone 2)}
+\begin{itemize}
+  \item \textbf{Attack Scenarios Testbed:} Built structured corpora in \texttt{configs/security\_scenarios.json} covering:
+  \begin{enumerate}[label=(\alph*)]
+    \item \textit{Direct Prompt Injection:} Directives attempting to override policy, disable verifiers, or force unsafe passes.
+    \item \textit{Indirect Code-Embedded Injection:} Adversarial instructions hidden inside C++ comments or string literals.
+    \item \textit{Trojan / Data Exfiltration:} Repaired code attempting access to environment keys (\texttt{AWS\_SECRET\_ACCESS\_KEY}), credentials (\texttt{/etc/passwd}), or network calls (\texttt{socket}, \texttt{curl}).
+    \item \textit{Benign Controls:} Standard C++ programs verifying that valid optimizations are not falsely flagged.
+  \end{enumerate}
+  \item \textbf{Automated Evaluation \& Metrics:} Implemented confusion-matrix evaluation in \texttt{src/safety/attack\_lab.py}:
+  \begin{equation*}
+    \text{Precision} = \frac{\text{TP}}{\text{TP} + \text{FP}}, \quad
+    \text{Recall} = \frac{\text{TP}}{\text{TP} + \text{FN}}, \quad
+    \text{F1} = 2 \cdot \frac{\text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}}
+  \end{equation*}
+  \item \textbf{Audit Logging:} Structured JSONL logs record timestamp, threat category, triggered rule, and block status at \texttt{/tmp/agentic\_c/attack\_lab\_log.jsonl}.
+\end{itemize}
+
+\subsection{Completed: Unified Dashboard Interface}
+\begin{itemize}
+  \item Integrated the 8-stage pipeline progression into \texttt{src/web\_ui/static/index.html} and \texttt{app.js}:
+  $$\text{Clang} \rightarrow \text{Safety Scan} \rightarrow \text{Boss Agent} \rightarrow \text{Fixer} \rightarrow \text{IR Tuner} \rightarrow \text{HW Tuner} \rightarrow \text{Policy Gate} \rightarrow \text{Verifier}$$
+  \item Added dedicated audit panels displaying scanner findings, allowlisted actions, and verification results.
+  \item Linked the standalone Attack Lab interface (\texttt{/attack\_lab.html}) from the main header.
+\end{itemize}
+
+\section{Completed: Full Closed-Loop Architecture Integration (Milestone 3)}
+
+\begin{enumerate}
+  \item \textbf{Connected Security Findings to Agent Reasoning (100\% Done)}
+  \begin{itemize}
+    \item \textit{Implementation:} Stage 1.5 feeds \texttt{security\_findings} and \texttt{SecurityAnalyzer.summarize\_for\_planner()} directly into \texttt{CompilationContext}, \texttt{BossAgent}, \texttt{IRTunerAgent}, and \texttt{HWTunerAgent}.
+    \item \textit{Outcome:} The agents prioritize safety-remediating passes (\texttt{sroa}, \texttt{mem2reg}, \texttt{instcombine}) and automatically exclude passes that could worsen memory safety around identified buffer/pointer findings (\texttt{loop-unroll}, \texttt{loop-vectorize}).
+  \end{itemize}
+
+  \item \textbf{Closed the Inner Iterative Critic Feedback Loop (100\% Done)}
+  \begin{itemize}
+    \item \textit{Implementation:} \texttt{SafeOptimizationController.step\_action()} and \texttt{optimize()} implement the closed feedback loop:
+    $$\text{Planner proposes pass} \longrightarrow \text{Policy Gate checks} \longrightarrow \text{LLVM Runner applies} \longrightarrow \text{Validator tests} \longrightarrow \text{Critic Feedback to Planner}$$
+    \item \textit{Outcome:} Whenever a proposed pass is rejected by policy or fails verification, the controller records structured critic feedback and injects allowlisted fallback alternatives (\texttt{critic\_fallback(...)}) into the active optimization queue.
+  \end{itemize}
+
+  \item \textbf{Implemented Empirical Wall-Clock Binary Benchmarking (100\% Done)}
+  \begin{itemize}
+    \item \textit{Implementation:} \texttt{CandidateValidator.\_benchmark\_runs()} compiles baseline and candidate LLVM IR to native executables via \texttt{clang++}, executes a warm-up pass, and measures median wall-clock nanosecond latency across multiple iterations.
+    \item \textit{Outcome:} Both CLI (\texttt{--benchmark}) and the Web UI report empirical binary execution latency deltas alongside \texttt{LatencyCostModel} hot-path estimates.
+  \end{itemize}
+
+  \item \textbf{Expanded Representative Behavior Test Fixtures (100\% Done)}
+  \begin{itemize}
+    \item \textit{Implementation:} Configured multi-case terminating stdin fixtures (\texttt{""}, \texttt{"100\textbackslash n"}, \texttt{"1000 250 5\textbackslash n"}) in \texttt{configs/config.yaml} and added baseline compilation caching in \texttt{CandidateValidator}.
+    \item \textit{Outcome:} Every candidate binary is verified for identical exit code, \texttt{stdout}, and \texttt{stderr} across all fixtures before acceptance.
+  \end{itemize}
+
+  \item \textbf{Integrated Live Attack Filtering \& Browser Source Editor (100\% Done)}
+  \begin{itemize}
+    \item \textit{Implementation:} Enabled \texttt{SecurityAnalyzer.scan\_adversarial\_directives()} at Stage 0 in \texttt{Pipeline.compile()} and added \texttt{GET /api/source} and \texttt{POST /api/compile} endpoints with an interactive C/C++ editor in the Web UI.
+    \item \textit{Outcome:} Adversarial prompt-injection directives embedded in comments or strings are blocked fail-closed at compiler entrance.
+  \end{itemize}
+\end{enumerate}
+
+\section{Summary Progress Scorecard}
+
+\begin{center}
+\begin{tabularx}{0.9\linewidth}{@{}lcr@{}}
+\toprule
+\textbf{Workstream} & \textbf{Weight} & \textbf{Completion} \\
+\midrule
+Compiler Frontend \& LLVM Pipeline Infrastructure & 20\% & 100\% \\
+Safety Boundary, Allowlist \& LLVM Runner & 25\% & 100\% \\
+Attack Lab, Scenarios \& Detection Metrics & 20\% & 100\% \\
+Candidate Validation \& Fixtures & 15\% & 100\% \\
+Agent Decision Loop (Security-Informed Planner \& Critic Loop) & 10\% & 100\% \\
+Empirical Hardware Benchmarking Harness & 10\% & 100\% \\
+\midrule
+\textbf{Total Weighted Progress (Full System)} & \textbf{100\%} & \textbf{100.0\%} \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\noindent\textbf{Conclusion:} All architectural blocks and safety milestones from the proposed Secure Agentic AI Compiler design are now 100\% implemented and verified end-to-end.
+
+\end{document}

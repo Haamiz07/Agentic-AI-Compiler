@@ -29,7 +29,7 @@
 
 static constexpr double BASE_SPREAD     = 0.0002;   // 2 bps base spread
 static constexpr double MAX_INVENTORY   = 500.0;    // maximum net position
-static constexpr double RISK_LIMIT      = 1000.0;   // max gross exposure
+static constexpr double RISK_LIMIT      = 10000.0;  // max gross exposure
 static constexpr double TICK_SIZE       = 0.01;     // minimum price increment
 static constexpr int    ORDER_LEVELS    = 3;        // quote levels each side
 static constexpr int    BOOK_DEPTH      = 10;       // order book depth tracked
